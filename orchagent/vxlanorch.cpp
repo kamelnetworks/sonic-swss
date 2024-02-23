@@ -348,16 +348,13 @@ create_tunnel(
         tunnel_attrs.push_back(attr);
     }
 
-    if (encap_ttl != 0)
-    {
-        attr.id = SAI_TUNNEL_ATTR_ENCAP_TTL_MODE;
-        attr.value.s32 = SAI_TUNNEL_TTL_MODE_PIPE_MODEL;
-        tunnel_attrs.push_back(attr);
+    attr.id = SAI_TUNNEL_ATTR_ENCAP_TTL_MODE;
+    attr.value.s32 = SAI_TUNNEL_TTL_MODE_PIPE_MODEL;
+    tunnel_attrs.push_back(attr);
 
-        attr.id = SAI_TUNNEL_ATTR_ENCAP_TTL_VAL;
-        attr.value.u8 = encap_ttl;
-        tunnel_attrs.push_back(attr);
-    }
+    attr.id = SAI_TUNNEL_ATTR_ENCAP_TTL_VAL;
+    attr.value.u8 = encap_ttl != 0 ? encap_ttl : 128;
+    tunnel_attrs.push_back(attr);
 
     sai_object_id_t tunnel_id;
     sai_status_t status = sai_tunnel_api->create_tunnel(
