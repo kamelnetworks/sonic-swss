@@ -606,7 +606,7 @@ class VxlanTunnel(object):
                         'SAI_TUNNEL_ATTR_PEER_MODE': 'SAI_TUNNEL_PEER_MODE_P2MP',
                         'SAI_TUNNEL_ATTR_ENCAP_SRC_IP': src_ip,
                         'SAI_TUNNEL_ATTR_ENCAP_TTL_MODE': 'SAI_TUNNEL_TTL_MODE_PIPE_MODEL',
-                        'SAI_TUNNEL_ATTR_ENCAP_TTL_VAL': '255',
+                        'SAI_TUNNEL_ATTR_ENCAP_TTL_VAL': '64',
                     }
                 )
 
@@ -714,7 +714,7 @@ class VxlanTunnel(object):
                         'SAI_TUNNEL_ATTR_ENCAP_SRC_IP': src_ip,
                         'SAI_TUNNEL_ATTR_ENCAP_DST_IP': dip,
                         'SAI_TUNNEL_ATTR_ENCAP_TTL_MODE': 'SAI_TUNNEL_TTL_MODE_PIPE_MODEL',
-                        'SAI_TUNNEL_ATTR_ENCAP_TTL_VAL': '255',
+                        'SAI_TUNNEL_ATTR_ENCAP_TTL_VAL': '64',
                     }
            
         ret = self.helper.get_key_with_attr(asic_db, self.ASIC_TUNNEL_TABLE, expected_tun_attributes)
