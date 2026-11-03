@@ -48,6 +48,7 @@ int main(int argc, char **argv)
             CFG_VXLAN_TUNNEL_TABLE_NAME,
             CFG_VXLAN_TUNNEL_MAP_TABLE_NAME,
             CFG_VXLAN_EVPN_NVO_TABLE_NAME,
+            CFG_VLAN_TABLE_NAME,
         };
 
         VxlanMgr vxlanmgr(&cfgDb, &appDb, &stateDb, cfg_vnet_tables);

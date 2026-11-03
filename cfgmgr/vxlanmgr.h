@@ -42,6 +42,7 @@ public:
         std::string vxlan_dev_name;
         std::string vlan;
         std::string vni_id;
+        std::string mtu;
     } MapCache;
 
     void waitTillReadyToReconcile();
@@ -66,10 +67,15 @@ private:
     bool doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t);
     bool doVxlanEvpnNvoDeleteTask(const KeyOpFieldsValuesTuple & t);
 
+    bool doVlanSetTask(const KeyOpFieldsValuesTuple & t);
+
     void createAppDBTunnelMapTable(const KeyOpFieldsValuesTuple & t);
     void delAppDBTunnelMapTable(std::string vxlanTunnelMapName);
     int createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_id,
-                             std::string src_ip, std::string dst_ip, std::string vlan_id);
+                             std::string src_ip, std::string dst_ip, std::string vlan_id,
+                             std::string mtu);
+    int setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std::string & mtu);
+    std::string getVlanMtu(const std::string & vlan);
     int downVxlanNetdevice(std::string vxlan_dev_name);
     int deleteVxlanNetdevice(std::string vxlan_dev_name);
     std::vector<std::string> parseNetDev(const std::string& stdout);
@@ -94,7 +100,7 @@ private:
 
     ProducerStateTable m_appVxlanTunnelTableProducer, m_appVxlanTunnelMapTable,m_appEvpnNvoTable;
     Table m_cfgVxlanTunnelTable,m_cfgVnetTable,m_stateVrfTable,m_stateVxlanTable, m_appSwitchTable, m_appVxlanTunnelTable;
-    Table m_stateVlanTable, m_stateNeighSuppressVlanTable, m_stateVxlanTunnelTable;
+    Table m_stateVlanTable, m_stateNeighSuppressVlanTable, m_stateVxlanTunnelTable, m_cfgVlanTable;
 
     /*
     * Vxlan Tunnel Cache

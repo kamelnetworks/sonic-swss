@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <algorithm>
+#include <cctype>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -38,6 +39,10 @@ extern MacAddress gMacAddress;
 #define VLAN "vlan"
 #define DST_IP "dst_ip"
 #define SOURCE_VTEP "source_vtep"
+#define MTU "mtu"
+
+// Same default as vlanmgrd uses for the Bridge and for VLANs without an explicit mtu
+#define DEFAULT_MTU_STR "9100"
 
 static std::string getVxlanName(const swss::VxlanMgr::VxlanInfo & info)
 {
@@ -65,6 +70,13 @@ static bool isValidIpLiteral(const std::string &address)
 static bool areValidVxlanTunnelAddresses(const std::string &srcIp, const std::string &dstIp)
 {
     return isValidIpLiteral(srcIp) && (dstIp.empty() || isValidIpLiteral(dstIp));
+}
+
+/* An MTU as it appears in CONFIG_DB: a short run of digits, nothing a shell could interpret */
+static bool isValidMtu(const std::string &mtu)
+{
+    return !mtu.empty() && mtu.size() <= 5 &&
+           std::all_of(mtu.begin(), mtu.end(), [](unsigned char c){ return std::isdigit(c); });
 }
 
 // Commands
@@ -224,7 +236,8 @@ VxlanMgr::VxlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb,
         m_stateVxlanTable(stateDb, STATE_VXLAN_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
         m_stateNeighSuppressVlanTable(stateDb, STATE_NEIGH_SUPPRESS_VLAN_TABLE_NAME),
-        m_stateVxlanTunnelTable(stateDb, STATE_VXLAN_TUNNEL_TABLE_NAME)
+        m_stateVxlanTunnelTable(stateDb, STATE_VXLAN_TUNNEL_TABLE_NAME),
+        m_cfgVlanTable(cfgDb, CFG_VLAN_TABLE_NAME)
 {
     getAllVxlanNetDevices();
 
@@ -271,6 +284,10 @@ void VxlanMgr::doTask(Consumer &consumer)
             {
                 task_result = doVxlanEvpnNvoCreateTask(t);
             }
+            else if (table_name == CFG_VLAN_TABLE_NAME)
+            {
+                task_result = doVlanSetTask(t);
+            }
             else
             {
                 SWSS_LOG_ERROR("Unknown table : %s", table_name.c_str());
@@ -293,6 +310,11 @@ void VxlanMgr::doTask(Consumer &consumer)
             else if (table_name == CFG_VXLAN_EVPN_NVO_TABLE_NAME)
             {
                 task_result = doVxlanEvpnNvoDeleteTask(t);
+            }
+            else if (table_name == CFG_VLAN_TABLE_NAME)
+            {
+                // The VXLAN netdev is removed with its tunnel map, nothing to do here
+                task_result = true;
             }
             else
             {
@@ -627,8 +649,10 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
         return true;
     }
 
+    const std::string mtu = getVlanMtu(vlan);
+
     createAppDBTunnelMapTable(t);
-    ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id);
+    ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id, mtu);
     if (ret != RET_SUCCESS)
     {
         SWSS_LOG_WARN("Vxlan Net Dev creation failure for %s VNI(%s) VLAN(%s)",
@@ -642,6 +666,7 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
     map_entry.vxlan_dev_name = vxlan_dev_name;
     map_entry.vlan = vlan;
     map_entry.vni_id = vni_id;
+    map_entry.mtu = mtu;
 
     m_vxlanTunnelMapCache[vxlanTunnelMapName] = map_entry;
     m_vlanMapCache[vlan] = vni_id;
@@ -996,7 +1021,7 @@ void VxlanMgr::delAppDBTunnelMapTable(std::string vxlanTunnelMapName)
 
 int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_id,
                                    std::string src_ip, std::string dst_ip,
-                                   std::string vlan_id)
+                                   std::string vlan_id, std::string mtu)
 {
     if (!areValidVxlanTunnelAddresses(src_ip, dst_ip))
     {
@@ -1014,9 +1039,9 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
     vxlan_dev_name = std::string("") + std::string(vxlanTunnelName) + "-" +
                      std::string(vlan_id);
 
-    SWSS_LOG_INFO("Kernel tnl_name: %s vni_id: %s src_ip: %s dst_ip:%s vlan_id: %s",
+    SWSS_LOG_INFO("Kernel tnl_name: %s vni_id: %s src_ip: %s dst_ip:%s vlan_id: %s mtu: %s",
                     vxlanTunnelName.c_str(), vni_id.c_str(), src_ip.c_str(), dst_ip.c_str(),
-                    vlan_id.c_str());
+                    vlan_id.c_str(), mtu.c_str());
 
     // Case 1: Entry exist - Erase from cache & return
     // Case 2: Entry does not exist - Create netDevice in Kernel
@@ -1030,7 +1055,9 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
             m_vxlanNetDevices.erase(it);
             SWSS_LOG_INFO("Reconcile VxlanNetDevice %s reconciled. Pending %zu",
                             vxlan_dev_name.c_str(), m_vxlanNetDevices.size());
-            return 0;
+            // The device survived a warm restart; make sure it carries the VLAN MTU
+            // (it may have been created by an image that left it at the kernel default).
+            return setVxlanNetdeviceMtu(vxlan_dev_name, mtu);
         }
         else
         {
@@ -1051,16 +1078,20 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
         evpn_nvo = true;
     }
 
-    // ip link add <vxlan_dev_name> type vxlan id <vni> local <src_ip> remote <dst_ip>
-    // dstport 4789
+    // ip link add <vxlan_dev_name> address <mac> mtu <mtu> type vxlan id <vni> local <src_ip>
+    // remote <dst_ip> nolearning dstport 4789
     // ip link set <vxlan_dev_name> master DOT1Q_BRIDGE_NAME
     // bridge vlan add vid <vlan_id> dev <vxlan_dev_name>
     // bridge vlan add vid <vlan_id> untagged pvid dev <vxlan_dev_name>
     // bridge link set dev <vxlan_dev_name> learning off
     // ip link set <vxlan_dev_name> up
 
+    // Without an explicit mtu the kernel gives the VXLAN netdev 1500 while the Bridge and
+    // the VlanN interfaces carry the VLAN MTU; the bridge then drops every CPU-terminated
+    // overlay frame above 1500 bytes at this port. Use the VLAN's MTU instead.
     link_add_cmd = std::string("") + IP_CMD + " link add " + vxlan_dev_name +
-                   " address " + gMacAddress.to_string() + " type vxlan id " +
+                   " address " + gMacAddress.to_string() +
+                   " mtu " + mtu + " type vxlan id " +
                    std::string(vni_id) + " local " + src_ip +
                    ((dst_ip  == "")? "":(" remote " + dst_ip)) +
                    " nolearning " + " dstport 4789";
@@ -1125,6 +1156,85 @@ int VxlanMgr::deleteVxlanNetdevice(std::string vxlan_dev_name)
     std::string res;
     const std::string cmd = std::string("") + IP_CMD  + " link del dev " + vxlan_dev_name;
     return swss::exec(cmd, res);
+}
+
+int VxlanMgr::setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std::string & mtu)
+{
+    std::string res;
+    const std::string cmd = std::string("") + IP_CMD + " link set dev " + vxlan_dev_name + " mtu " + mtu;
+    return swss::exec(cmd, res);
+}
+
+/* The VLAN's configured MTU (CONFIG_DB VLAN|<vlan> mtu), or the SONiC default if unset */
+std::string VxlanMgr::getVlanMtu(const std::string & vlan)
+{
+    std::vector<FieldValueTuple> fvs;
+    if (m_cfgVlanTable.get(vlan, fvs))
+    {
+        for (const auto & fv : fvs)
+        {
+            if (fvField(fv) != MTU)
+            {
+                continue;
+            }
+            if (isValidMtu(fvValue(fv)))
+            {
+                return fvValue(fv);
+            }
+            SWSS_LOG_WARN("Ignoring invalid mtu '%s' of %s, using %s",
+                          fvValue(fv).c_str(), vlan.c_str(), DEFAULT_MTU_STR);
+        }
+    }
+    return DEFAULT_MTU_STR;
+}
+
+/* Keep the MTU of a mapped VLAN's VXLAN netdev in sync with the VLAN's MTU */
+bool VxlanMgr::doVlanSetTask(const KeyOpFieldsValuesTuple & t)
+{
+    SWSS_LOG_ENTER();
+
+    const std::string & vlan = kfvKey(t);
+    if (m_vlanMapCache.find(vlan) == m_vlanMapCache.end())
+    {
+        // No VNI mapped (yet): the MTU is read when the map and the netdev are created
+        return true;
+    }
+
+    std::string mtu = DEFAULT_MTU_STR;
+    for (const auto & fv : kfvFieldsValues(t))
+    {
+        if (fvField(fv) != MTU)
+        {
+            continue;
+        }
+        if (isValidMtu(fvValue(fv)))
+        {
+            mtu = fvValue(fv);
+        }
+        else
+        {
+            SWSS_LOG_WARN("Ignoring invalid mtu '%s' of %s, using %s",
+                          fvValue(fv).c_str(), vlan.c_str(), DEFAULT_MTU_STR);
+        }
+    }
+
+    for (auto & map : m_vxlanTunnelMapCache)
+    {
+        MapCache & map_entry = map.second;
+        if (map_entry.vlan != vlan || map_entry.mtu == mtu)
+        {
+            continue;
+        }
+        SWSS_LOG_NOTICE("Setting MTU %s on VxlanNetDevice %s for %s",
+                        mtu.c_str(), map_entry.vxlan_dev_name.c_str(), vlan.c_str());
+        if (setVxlanNetdeviceMtu(map_entry.vxlan_dev_name, mtu) != RET_SUCCESS)
+        {
+            SWSS_LOG_WARN("Failed to set MTU %s on VxlanNetDevice %s",
+                          mtu.c_str(), map_entry.vxlan_dev_name.c_str());
+        }
+        map_entry.mtu = mtu;
+    }
+    return true;
 }
 
 std::vector<std::string> VxlanMgr::parseNetDev(const string& stdout){
@@ -1256,7 +1366,7 @@ void VxlanMgr::restoreVxlanNetDevices()
         const auto vxlanTunnelName = vxlanTunnelMapName.substr(0, found);
 
         int ret;
-        ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id);
+        ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id, getVlanMtu(vlan));
         if (ret != RET_SUCCESS)
         {
             SWSS_LOG_WARN("Vxlan Net Dev creation failure for %s VNI(%s) VLAN(%s)",

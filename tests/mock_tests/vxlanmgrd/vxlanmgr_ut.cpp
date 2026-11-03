@@ -139,6 +139,17 @@ namespace vxlanmgr_ut
         EXPECT_NE(string::npos, cmd.find(" mtu 9100 type vxlan ")) << cmd;
     }
 
+    /* An mtu that is not a number is not interpolated into the shell command; the default is used. */
+    TEST_F(VxlanMgrTest, NetdevCreatedWithDefaultMtuWhenVlanMtuIsInvalid)
+    {
+        createMapping("Vlan300", "300", { {"vlanid", "300"}, {"mtu", "9000; touch /tmp/x"} });
+
+        string cmd = linkAddCmd("vtep-300");
+        ASSERT_NE("", cmd) << "vtep-300 was not created";
+        EXPECT_NE(string::npos, cmd.find(" mtu 9100 type vxlan ")) << cmd;
+        EXPECT_EQ(string::npos, cmd.find("touch")) << cmd;
+    }
+
     /* Changing the VLAN MTU is applied to the mapped netdev; VLANs without a map are ignored. */
     TEST_F(VxlanMgrTest, VlanMtuChangeUpdatesNetdev)
     {
