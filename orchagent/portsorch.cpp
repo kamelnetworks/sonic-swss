@@ -1570,6 +1570,9 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
 
         createdPorts.push_back(addedPorts.at(i));
         createdOids.push_back(oidList.at(i));
+
+        // Clear a failure an earlier create of this port left for portsyncd
+        m_portStateTable.hdel(portList.at(i).key, "create_status");
     }
 
     addedPorts.swap(createdPorts);
@@ -4719,8 +4722,10 @@ bool PortsOrch::programSerdes(
  * Create and initialize one port at runtime, e.g. a child port of a breakout.
  * On failure the task iterator is advanced: kept for a retry if the SAI asked
  * for one, otherwise dropped. A port the SAI refuses (a breakout mode the ASIC
- * can't do) stays absent from ASIC_DB and is reported in the log and through
- * the response publisher; its row stays in APPL_DB until it is removed or fixed.
+ * can't do) stays absent from ASIC_DB and is reported in the log, through
+ * the response publisher and as STATE_DB PORT_TABLE create_status "failed",
+ * which portsyncd honours at init; its row stays in APPL_DB until it is
+ * removed or fixed.
  */
 bool PortsOrch::addPortWithRetry(Consumer &consumer, SyncMap::iterator &it, const PortConfig &pCfg)
 {
@@ -4749,6 +4754,9 @@ bool PortsOrch::addPortWithRetry(Consumer &consumer, SyncMap::iterator &it, cons
 
     m_publisher.publish(consumer.getTableName(), pCfg.key, kfvFieldsValues(it->second),
                         ReturnCode(StatusCode::SWSS_RC_INVALID_PARAM) << "Port create refused by the SAI");
+
+    // Its netdev will never appear: tell portsyncd not to hold PortInitDone for it
+    m_portStateTable.hset(pCfg.key, "create_status", "failed");
 
     removePortFromLanesMap(pCfg.key);
     m_portConfigMap.erase(pCfg.key);
@@ -4970,7 +4978,11 @@ void PortsOrch::doPortTask(Consumer &consumer)
                         }
                     }
 
-                    initPortsBulk(addedPorts);
+                    // Skip the bulk get/set of an empty list if every create was refused
+                    if (!addedPorts.empty())
+                    {
+                        initPortsBulk(addedPorts);
+                    }
                 }
 
                 setPortConfigState(PORT_CONFIG_DONE);
@@ -5869,6 +5881,7 @@ void PortsOrch::doPortTask(Consumer &consumer)
             if (!getPort(pCfg.key, p))
             {
                 SWSS_LOG_ERROR("Failed to remove port: alias %s doesn't exist", pCfg.key.c_str());
+                m_portStateTable.hdel(pCfg.key, "create_status");
                 m_portConfigMap.erase(pCfg.key);
                 it = taskMap.erase(it);
                 continue;

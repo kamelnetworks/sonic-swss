@@ -1184,6 +1184,8 @@ Stores information for physical switch ports managed by the switch chip. Ports t
     key                 = PORT_TABLE|ifname    ; ifname must be unique across PORT,INTF,VLAN,LAG TABLES
     oper_status         = "down" / "up" ; oper status
     state               = "" / "ok"     ; port created successfully
+    create_status       = "failed"      ; set by orchagent when the SAI refused to create the port;
+                                        ; portsyncd then stops waiting for its netdev before PortInitDone
 
 ### MGMT_PORT_TABLE
     ;State for management port, including at least one key
