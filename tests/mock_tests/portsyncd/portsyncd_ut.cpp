@@ -305,4 +305,55 @@ namespace portsyncd_ut
         std::vector<swss::FieldValueTuple> ovalues;
         ASSERT_EQ(sync.m_statePortTable.get("Ethernet0", ovalues), false);
     }
+
+    /*
+     * kamelnetworks/sonic-buildimage#172: a port orchagent failed to create
+     * never gets a netdev. Once orchagent marks it in STATE_DB, PortInitDone
+     * no longer waits for it.
+     */
+    TEST_F(PortSyncdTest, test_checkPortInitDoneSkipsCreateFailedPort)
+    {
+        swss::LinkSync sync(m_app_db.get(), m_state_db.get());
+        populateCfgDb(m_portCfgTable.get());
+        swss::DBConnector cfg_db_conn("CONFIG_DB", 0);
+        swss::ProducerStateTable p(m_app_db.get(), APP_PORT_TABLE_NAME);
+        g_portSet.clear();
+        g_init = false;
+        writeToApplDB(p, cfg_db_conn);
+
+        std::vector<unsigned int> flags = {IFF_UP, IFF_RUNNING};
+        struct nl_object* msg = draft_nlmsg("Ethernet0", flags, "sx_netdev", "1c:34:da:1c:9f:00", 142, 9100, 0);
+        sync.onMsg(RTM_NEWLINK, msg);
+        free_nlobj(msg);
+
+        /* Ethernet4 has no netdev yet: keep waiting */
+        std::vector<swss::FieldValueTuple> ovalues;
+        sync.checkPortInitDone();
+        ASSERT_FALSE(g_init);
+        ASSERT_FALSE(m_portAppTable->get("PortInitDone", ovalues));
+        ASSERT_EQ(g_portSet, std::set<std::string>({ "Ethernet4" }));
+
+        /* Any other create_status is not a failure */
+        sync.m_statePortTable.hset("Ethernet4", "create_status", "pending");
+        sync.m_lastCreateFailedCheck = {};
+        sync.checkPortInitDone();
+        ASSERT_FALSE(g_init);
+
+        /* The mark is checked at most once a second */
+        sync.m_statePortTable.hset("Ethernet4", "create_status", "failed");
+        sync.checkPortInitDone();
+        ASSERT_FALSE(g_init);
+
+        sync.m_lastCreateFailedCheck = {};
+        sync.checkPortInitDone();
+        ASSERT_TRUE(g_init);
+        ASSERT_TRUE(g_portSet.empty());
+        ASSERT_TRUE(m_portAppTable->get("PortInitDone", ovalues));
+
+        /* Sent once only */
+        m_portAppTable->del("PortInitDone");
+        sync.checkPortInitDone();
+        ASSERT_FALSE(m_portAppTable->get("PortInitDone", ovalues));
+        g_init = false;
+    }
 }
