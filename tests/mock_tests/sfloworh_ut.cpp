@@ -263,6 +263,25 @@ namespace sflow_test
             static_cast<Orch*>(this->sflowOrch.get())->doTask(*consumer);
         }
 
+        // A consumer that keeps its pending (deferred) tasks between drains,
+        // like the real one in orchagent.
+        Consumer& sessionConsumer()
+        {
+            if (!m_sessionConsumer)
+            {
+                m_sessionConsumer = std::unique_ptr<Consumer>(new Consumer(
+                    new ConsumerStateTable(this->appDb.get(), APP_SFLOW_SESSION_TABLE_NAME, 1, 1),
+                    this->sflowOrch.get(), APP_SFLOW_SESSION_TABLE_NAME
+                ));
+            }
+            return *m_sessionConsumer;
+        }
+
+        void drainSessionConsumer()
+        {
+            static_cast<Orch*>(this->sflowOrch.get())->doTask(sessionConsumer());
+        }
+
         SflowOrch& get()
         {
             return *sflowOrch;
@@ -271,7 +290,56 @@ namespace sflow_test
     private:
         std::shared_ptr<SflowOrch> sflowOrch;
         std::shared_ptr<DBConnector> appDb;
+        std::unique_ptr<Consumer> m_sessionConsumer;
     };
+
+    // Remove a port from PortsOrch (and the SAI), as a dynamic port breakout does.
+    void removePortFromPortsOrch(const string &alias)
+    {
+        auto consumer = dynamic_cast<Consumer*>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        consumer->addToSync({ { alias, DEL_COMMAND, { } } });
+
+        std::vector<std::string> taskList;
+        for (int i = 0; i < 8; ++i)
+        {
+            static_cast<Orch*>(gPortsOrch)->doTask();
+            taskList.clear();
+            gPortsOrch->dumpPendingTasks(taskList);
+            if (taskList.empty())
+            {
+                break;
+            }
+        }
+        ASSERT_TRUE(taskList.empty());
+
+        Port port;
+        ASSERT_FALSE(gPortsOrch->getPort(alias, port));
+    }
+
+    // Re-add a port to PortsOrch, which creates a new SAI port (new oid).
+    void addPortToPortsOrch(const string &alias, const vector<FieldValueTuple> &fvs)
+    {
+        auto consumer = dynamic_cast<Consumer*>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        consumer->addToSync({ { alias, SET_COMMAND, fvs } });
+        static_cast<Orch*>(gPortsOrch)->doTask();
+
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        ASSERT_TRUE(taskList.empty());
+
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort(alias, port));
+        ASSERT_NE(port.m_port_id, SAI_NULL_OBJECT_ID);
+    }
+
+    sai_object_id_t getIngressSamplepacket(sai_object_id_t port_id)
+    {
+        sai_attribute_t attr;
+        attr.id = SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE;
+        attr.value.oid = SAI_NULL_OBJECT_ID;
+        EXPECT_EQ(sai_port_api->get_port_attribute(port_id, 1, &attr), SAI_STATUS_SUCCESS);
+        return attr.value.oid;
+    }
 
     void setDropMonitorLimit(MockSflowOrch &mock_orch, const string &limit)
     {
@@ -1398,6 +1466,122 @@ namespace sflow_test
         sai_port_api->set_port_attribute(port.m_port_id, &attr);
         sai_samplepacket_api->remove_samplepacket(my_sflow_oid);
         sai_samplepacket_api->remove_samplepacket(foreign_oid);
+    }
+
+    /* Dynamic port breakout: sflowmgrd publishes the session for a re-added
+     * port before PortsOrch has created it. The session must wait for the port
+     * instead of being bound to a null port oid (kamelnetworks/sonic-buildimage#166). */
+    TEST_F(SflowOrchTest, SflowSessionWaitsForPortCreation)
+    {
+        // libsaivs cannot read SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE back; emulate it
+        mirror_sample_port_wrap_ut::PortSampleSaiGuard saiPortSampleGuard;
+        MockSflowOrch mock_orch;
+        setSflowGlobal(mock_orch, { {"admin_state", "up"} });
+        ASSERT_TRUE(Portal::SflowOrchInternal::getSflowStatusEnable(mock_orch.get()));
+
+        Port old_port;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", old_port));
+        auto port_fvs = ut_helper::getInitialSaiPorts().at("Ethernet0");
+
+        removePortFromPortsOrch("Ethernet0");
+
+        // The session arrives while the port does not exist
+        mock_orch.sessionConsumer().addToSync({
+            {
+                "Ethernet0",
+                SET_COMMAND,
+                {
+                    {"admin_state", "up"},
+                    {"sample_rate", "1000"},
+                    {"sample_direction", "rx"}
+                }
+            }
+        });
+        mock_orch.drainSessionConsumer();
+
+        // Deferred: still pending, nothing recorded under a null port oid
+        EXPECT_EQ(mock_orch.sessionConsumer().m_toSync.size(), 1u);
+        auto info = Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get());
+        EXPECT_EQ(info.find(SAI_NULL_OBJECT_ID), info.end());
+        EXPECT_EQ(info.find(old_port.m_port_id), info.end());
+        EXPECT_TRUE(info.empty());
+
+        // A second drain while the port is still missing changes nothing
+        mock_orch.drainSessionConsumer();
+        EXPECT_EQ(mock_orch.sessionConsumer().m_toSync.size(), 1u);
+        EXPECT_TRUE(Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get()).empty());
+
+        // PortsOrch creates the port, then the deferred session is applied to it
+        addPortToPortsOrch("Ethernet0", port_fvs);
+        Port new_port;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", new_port));
+
+        mock_orch.drainSessionConsumer();
+        EXPECT_TRUE(mock_orch.sessionConsumer().m_toSync.empty());
+
+        info = Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get());
+        ASSERT_NE(info.find(new_port.m_port_id), info.end());
+        EXPECT_TRUE(info.at(new_port.m_port_id).admin_state);
+        EXPECT_EQ(info.find(SAI_NULL_OBJECT_ID), info.end());
+
+        auto sessions = Portal::SflowOrchInternal::getSflowSampleMap(mock_orch.get());
+        ASSERT_NE(sessions.find(1000), sessions.end());
+        EXPECT_EQ(sessions.at(1000).ref_count, 1u);
+        EXPECT_EQ(getIngressSamplepacket(new_port.m_port_id), sessions.at(1000).m_sample_id);
+
+        // Later breakouts must not be affected by the first one
+        removePortFromPortsOrch("Ethernet0");
+        mock_orch.sessionConsumer().addToSync({ { "Ethernet0", DEL_COMMAND, { } } });
+        mock_orch.drainSessionConsumer();
+        EXPECT_TRUE(mock_orch.sessionConsumer().m_toSync.empty());
+        EXPECT_TRUE(Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get()).empty());
+        EXPECT_TRUE(Portal::SflowOrchInternal::getSflowSampleMap(mock_orch.get()).empty());
+    }
+
+    /* The session DEL can arrive after PortsOrch has already removed the port.
+     * Its bookkeeping and session reference must still be released. */
+    TEST_F(SflowOrchTest, SflowSessionDelAfterPortRemoved)
+    {
+        // libsaivs cannot read SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE back; emulate it
+        mirror_sample_port_wrap_ut::PortSampleSaiGuard saiPortSampleGuard;
+        MockSflowOrch mock_orch;
+        setSflowGlobal(mock_orch, { {"admin_state", "up"} });
+        ASSERT_TRUE(Portal::SflowOrchInternal::getSflowStatusEnable(mock_orch.get()));
+
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet4", port));
+
+        mock_orch.sessionConsumer().addToSync({
+            {
+                "Ethernet4",
+                SET_COMMAND,
+                {
+                    {"admin_state", "up"},
+                    {"sample_rate", "2000"},
+                    {"sample_direction", "rx"}
+                }
+            }
+        });
+        mock_orch.drainSessionConsumer();
+        EXPECT_TRUE(mock_orch.sessionConsumer().m_toSync.empty());
+
+        auto info = Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get());
+        ASSERT_NE(info.find(port.m_port_id), info.end());
+        auto sessions = Portal::SflowOrchInternal::getSflowSampleMap(mock_orch.get());
+        ASSERT_NE(sessions.find(2000), sessions.end());
+        EXPECT_EQ(getIngressSamplepacket(port.m_port_id), sessions.at(2000).m_sample_id);
+
+        // PortsOrch removes the port first, then the session DEL arrives
+        removePortFromPortsOrch("Ethernet4");
+        mock_orch.sessionConsumer().addToSync({ { "Ethernet4", DEL_COMMAND, { } } });
+        mock_orch.drainSessionConsumer();
+        EXPECT_TRUE(mock_orch.sessionConsumer().m_toSync.empty());
+
+        info = Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get());
+        EXPECT_EQ(info.find(port.m_port_id), info.end());
+        EXPECT_TRUE(info.empty());
+        sessions = Portal::SflowOrchInternal::getSflowSampleMap(mock_orch.get());
+        EXPECT_EQ(sessions.find(2000), sessions.end());
     }
 
 }
