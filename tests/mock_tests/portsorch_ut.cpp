@@ -1207,6 +1207,229 @@ namespace portsorch_test
         ASSERT_TRUE(keys.empty());
     }
 
+    /*
+     * Emulates a SAI that refuses some ports of a bulk create, as the Broadcom
+     * TD3 SAI refuses a breakout mode the ASIC can't do ("Mixed-sister oversub
+     * ports are not supported"): any port holding _ut_refused_lane fails, the
+     * rest are created.
+     */
+    uint32_t _ut_refused_lane = UINT32_MAX;
+    uint32_t _ut_refused_creates = 0;
+
+    sai_status_t _ut_stub_sai_create_ports_refuse_lane(
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t object_count,
+        _In_ const uint32_t *attr_count,
+        _In_ const sai_attribute_t **attr_list,
+        _In_ sai_bulk_op_error_mode_t mode,
+        _Out_ sai_object_id_t *object_id,
+        _Out_ sai_status_t *object_statuses)
+    {
+        sai_status_t status = SAI_STATUS_SUCCESS;
+
+        for (uint32_t i = 0; i < object_count; i++)
+        {
+            bool refused = false;
+            for (uint32_t j = 0; j < attr_count[i]; j++)
+            {
+                const auto &attr = attr_list[i][j];
+                if (attr.id != SAI_PORT_ATTR_HW_LANE_LIST)
+                {
+                    continue;
+                }
+                for (uint32_t k = 0; k < attr.value.u32list.count; k++)
+                {
+                    refused |= attr.value.u32list.list[k] == _ut_refused_lane;
+                }
+            }
+
+            if (refused)
+            {
+                _ut_refused_creates++;
+                object_id[i] = SAI_NULL_OBJECT_ID;
+                object_statuses[i] = SAI_STATUS_FAILURE;
+                status = SAI_STATUS_FAILURE;
+                continue;
+            }
+
+            object_statuses[i] = pold_sai_port_api->create_port(&object_id[i], switch_id, attr_count[i], attr_list[i]);
+            if (object_statuses[i] != SAI_STATUS_SUCCESS)
+            {
+                status = SAI_STATUS_FAILURE;
+            }
+        }
+
+        return status;
+    }
+
+    /*
+     * kamelnetworks/sonic-buildimage#172: a breakout mode the SAI refuses must
+     * not take swss down. The refused child is dropped and not retried, its
+     * sibling is created, and the other ports are untouched.
+     */
+    TEST_F(PortsOrchTest, PortBreakoutRefusedCreateIsDropped)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        auto consumer = dynamic_cast<Consumer *>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> entries;
+
+        auto &ports = defaultPortList;
+        ASSERT_TRUE(!ports.empty());
+
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { "lanes", "0" } });
+        gPortsOrch->addExistingData(&portTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        string parentLanes;
+        for (const auto &fv : ports.at("Ethernet0"))
+        {
+            if (fvField(fv) == "lanes")
+            {
+                parentLanes = fvValue(fv);
+            }
+        }
+        vector<string> lanes = tokenize(parentLanes, ',');
+        ASSERT_EQ(lanes.size(), 4u);
+
+        const auto portCount = gPortsOrch->getAllPorts().size();
+
+        entries.push_back({ "Ethernet0", DEL_COMMAND, { } });
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        entries.clear();
+
+        Port p;
+        ASSERT_FALSE(gPortsOrch->getPort("Ethernet0", p));
+
+        // 2x50G: the SAI refuses the first child and accepts the second.
+        _ut_refused_lane = static_cast<uint32_t>(stoul(lanes[0]));
+        _ut_refused_creates = 0;
+        _hook_sai_port_api();
+        ut_sai_port_api.create_ports = _ut_stub_sai_create_ports_refuse_lane;
+
+        entries.push_back({ "Ethernet100", SET_COMMAND, {
+            { "lanes", lanes[0] + "," + lanes[1] },
+            { "speed", "50000" },
+            { "admin_status", "up" }
+        } });
+        entries.push_back({ "Ethernet102", SET_COMMAND, {
+            { "lanes", lanes[2] + "," + lanes[3] },
+            { "speed", "50000" },
+            { "admin_status", "up" }
+        } });
+        consumer->addToSync(entries);
+        entries.clear();
+
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        _unhook_sai_port_api();
+
+        // Refused once, then dropped instead of retried on every doTask()
+        EXPECT_EQ(_ut_refused_creates, 1u);
+        EXPECT_FALSE(gPortsOrch->getPort("Ethernet100", p));
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet102", p));
+        EXPECT_NE(p.m_port_id, SAI_NULL_OBJECT_ID);
+        EXPECT_EQ(gPortsOrch->getAllPorts().size(), portCount);
+
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        for (const auto &task : taskList)
+        {
+            EXPECT_EQ(task.find("Ethernet100|"), std::string::npos) << task;
+        }
+
+        // The lanes are free again: a mode the SAI accepts can take them.
+        entries.push_back({ "Ethernet100", SET_COMMAND, {
+            { "lanes", lanes[0] + "," + lanes[1] },
+            { "speed", "50000" }
+        } });
+        consumer->addToSync(entries);
+        entries.clear();
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet100", p));
+        EXPECT_NE(p.m_port_id, SAI_NULL_OBJECT_ID);
+        _ut_refused_lane = UINT32_MAX;
+
+        cleanupPorts(gPortsOrch);
+    }
+
+    /*
+     * kamelnetworks/sonic-buildimage#172: a refused row already in CONFIG_DB at
+     * swss start must not fail init. The other ports are created and PortsOrch
+     * finishes port configuration.
+     */
+    TEST_F(PortsOrchTest, PortInitRefusedCreateIsDropped)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+
+        auto ports = defaultPortList;
+        ASSERT_TRUE(!ports.empty());
+
+        string parentLanes;
+        for (const auto &fv : ports.at("Ethernet0"))
+        {
+            if (fvField(fv) == "lanes")
+            {
+                parentLanes = fvValue(fv);
+            }
+        }
+        vector<string> lanes = tokenize(parentLanes, ',');
+        ASSERT_EQ(lanes.size(), 4u);
+
+        // Ethernet0 in a 2x50G mode the SAI refuses for its first child
+        ports.erase("Ethernet0");
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("Ethernet100", { { "lanes", lanes[0] + "," + lanes[1] }, { "speed", "50000" } });
+        portTable.set("Ethernet102", { { "lanes", lanes[2] + "," + lanes[3] }, { "speed", "50000" } });
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size() + 2) } });
+        portTable.set("PortInitDone", { { "lanes", "0" } });
+        gPortsOrch->addExistingData(&portTable);
+
+        _ut_refused_lane = static_cast<uint32_t>(stoul(lanes[0]));
+        _ut_refused_creates = 0;
+        _hook_sai_port_api();
+        ut_sai_port_api.create_ports = _ut_stub_sai_create_ports_refuse_lane;
+
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        _unhook_sai_port_api();
+        _ut_refused_lane = UINT32_MAX;
+
+        // The init bulk and one retry of the refused port, then no more
+        EXPECT_EQ(_ut_refused_creates, 2u);
+        EXPECT_TRUE(gPortsOrch->isConfigDone());
+
+        Port p;
+        EXPECT_FALSE(gPortsOrch->getPort("Ethernet100", p));
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet102", p));
+        for (const auto &it : ports)
+        {
+            EXPECT_TRUE(gPortsOrch->getPort(it.first, p)) << it.first;
+        }
+
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        for (const auto &task : taskList)
+        {
+            EXPECT_EQ(task.find("Ethernet100|"), std::string::npos) << task;
+        }
+
+        cleanupPorts(gPortsOrch);
+    }
+
     // Verifies certain port attributes are configured for the port creation flow.
     TEST_F(PortsOrchTest, PortAttributeSetOnCreation)
     {
