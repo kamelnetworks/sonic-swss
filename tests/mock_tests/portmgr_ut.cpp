@@ -4,6 +4,8 @@
 #include "redisutility.h"
 
 extern std::vector<std::string> mockCallArgs;
+extern int mockCmdReturn;
+extern std::string mockCmdStdcout;
 
 namespace portmgr_ut
 {
@@ -86,6 +88,63 @@ namespace portmgr_ut
         value_opt = swss::fvsGetValue(values, "admin_status", true);
         ASSERT_TRUE(value_opt);
         ASSERT_EQ("up", value_opt.get());
+    }
+
+    // kamelnetworks/sonic-buildimage#12: the kernel refuses to change the MTU
+    // of a PortChannel member (RTNETLINK answers: Operation not permitted).
+    // portmgrd used to throw on that and supervisord then took the whole swss
+    // container down with it. The MTU of a member follows its PortChannel
+    // (teammgrd writes it to APP_DB), so the failed change must be logged and
+    // dropped, not retried and never fatal.
+    TEST_F(PortMgrTest, LagMemberMtuChangeIsNotFatal)
+    {
+        Table state_port_table(m_state_db.get(), STATE_PORT_TABLE_NAME);
+        Table app_port_table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table cfg_port_table(m_config_db.get(), CFG_PORT_TABLE_NAME);
+
+        // Port is created and ready, default MTU and admin status applied
+        cfg_port_table.set("Ethernet0", {
+            {"speed", "100000"},
+            {"index", "1"}
+        });
+        state_port_table.set("Ethernet0", {
+            {"state", "ok"}
+        });
+        mockCallArgs.clear();
+        mockCmdReturn = 0;
+        mockCmdStdcout = "";
+        m_portMgr->addExistingData(&cfg_port_table);
+        m_portMgr->doTask();
+        ASSERT_EQ(size_t(2), mockCallArgs.size());
+        ASSERT_EQ("/sbin/ip link set dev \"Ethernet0\" mtu \"9100\"", mockCallArgs[0]);
+
+        // The port is now a PortChannel member and CONFIG_DB gets an MTU that
+        // differs from the PortChannel's: ip(8) fails with exit status 2
+        cfg_port_table.set("Ethernet0", {
+            {"mtu", "9216"}
+        });
+        mockCallArgs.clear();
+        mockCmdReturn = 2;
+        mockCmdStdcout = "RTNETLINK answers: Operation not permitted";
+        m_portMgr->addExistingData(&cfg_port_table);
+        EXPECT_NO_THROW(m_portMgr->doTask());
+        mockCmdReturn = 0;
+        mockCmdStdcout = "";
+
+        ASSERT_EQ(size_t(1), mockCallArgs.size());
+        ASSERT_EQ("/sbin/ip link set dev \"Ethernet0\" mtu \"9216\"", mockCallArgs[0]);
+
+        // APP_DB keeps the MTU the netdev really has
+        std::vector<FieldValueTuple> values;
+        app_port_table.get("Ethernet0", values);
+        auto value_opt = swss::fvsGetValue(values, "mtu", true);
+        ASSERT_TRUE(value_opt);
+        ASSERT_EQ(DEFAULT_MTU_STR, value_opt.get());
+
+        // The failed change is dropped, not retried
+        mockCallArgs.clear();
+        m_portMgr->doTask();
+        ASSERT_TRUE(mockCallArgs.empty());
     }
 
     TEST_F(PortMgrTest, ConfigureDuringRetry)
