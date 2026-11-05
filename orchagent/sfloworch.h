@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <inttypes.h>
 
@@ -12,6 +13,7 @@
 struct SflowPortInfo
 {
     bool            admin_state;
+    string          m_alias;
     string          m_sample_dir;
     sai_object_id_t m_sample_id;
 };
@@ -114,6 +116,8 @@ private:
     SflowRateSampleMap  m_sflowRateSampleMap;
     bool                m_sflowStatus;
     SflowDropMonitor    m_sflowDropMonitor;
+    // Ports whose session is waiting for PortsOrch to create the port (logged once each)
+    std::set<string>    m_sflowPendingPorts;
 
 
     virtual void doTask(Consumer& consumer);
@@ -126,6 +130,8 @@ private:
     bool sflowUpdateSampleDirection(sai_object_id_t port_id, string old_dir, string new_dir);
     uint32_t sflowSessionGetRate(sai_object_id_t sample_id);
     bool handleSflowSessionDel(sai_object_id_t port_id);
+    bool handleSflowSessionDelByAlias(const string &alias);
+    bool releaseSflowPortInfo(SflowPortInfoMap::iterator port_info);
     void sflowExtractInfo(vector<FieldValueTuple> &fvs, bool &admin, uint32_t &rate, string &dir);
     void sflowExtractGlobalInfo(vector<FieldValueTuple> &fvs, bool &admin, uint32_t &rate, string &dir, int32_t &drop_monitor_limit);
     bool isSflowSamplePacket(sai_object_id_t oid);
