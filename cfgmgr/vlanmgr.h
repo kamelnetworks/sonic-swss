@@ -21,12 +21,14 @@ public:
 private:
     ProducerStateTable m_appVlanTableProducer, m_appVlanMemberTableProducer;
     ProducerStateTable m_appFdbTableProducer, m_appPortTableProducer;
-    Table m_cfgVlanTable, m_cfgVlanMemberTable;
+    Table m_cfgVlanTable, m_cfgVlanMemberTable, m_cfgLagMemberTable;
     Table m_statePortTable, m_stateLagTable;
     Table m_stateVlanTable, m_stateVlanMemberTable;
     std::set<std::string> m_vlans;
     std::set<std::string> m_vlanReplay;
     std::set<std::string> m_vlanMemberReplay;
+    /* VLAN members whose add is deferred because the port is a LAG member */
+    std::set<std::string> m_deferredVlanMembers;
     bool replayDone;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> m_PortVlanMember;
     
@@ -46,6 +48,7 @@ private:
     bool isVlanStateOk(const std::string &alias);
     bool isVlanMacOk();
     bool isVlanMemberStateOk(const std::string &vlanMemberKey);
+    bool isConfiguredLagMember(const std::string &port_alias, std::string &lag_alias);
     void doVlanPacPortTask(Consumer &consumer);
     void doVlanPacFdbTask(Consumer &consumer);
     void doVlanPacVlanMemberTask(Consumer &consumer);

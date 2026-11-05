@@ -6524,18 +6524,28 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
                     continue;
                 }
 
-                // Skip adding port to LAG if the port is still a member of one or more VLANs.
+                // Defer adding the port to the LAG while it is still a member of one or more VLANs.
                 if (m_portVlanMember[port.m_alias].size() > 0)
-				{
-                    SWSS_LOG_DEBUG("Port %s is still a member of %zu VLAN(s), skipping adding port to port channel.", port.m_alias.c_str(), m_portVlanMember[port.m_alias].size());
+                {
+                    if (m_deferredLagMembers.insert(port.m_alias).second)
+                    {
+                        SWSS_LOG_WARN("Port %s is still a member of %zu VLAN(s), deferring adding it to %s until it leaves them",
+                                      port.m_alias.c_str(), m_portVlanMember[port.m_alias].size(), lag_alias.c_str());
+                    }
                     it++;
                     continue;
-                } 
-                
+                }
+
                 if(!addLagMember(lag, port, status))
                 {
                     it++;
                     continue;
+                }
+
+                if (m_deferredLagMembers.erase(port.m_alias))
+                {
+                    SWSS_LOG_NOTICE("Port %s is no longer a VLAN member, added the deferred member to %s",
+                                    port.m_alias.c_str(), lag_alias.c_str());
                 }
             }
 
@@ -6583,6 +6593,12 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
         /* Remove a LAG member */
         else if (op == DEL_COMMAND)
         {
+            if (m_deferredLagMembers.erase(port_alias))
+            {
+                SWSS_LOG_NOTICE("Deferred member %s of %s was removed before it left its VLAN(s)",
+                                port_alias.c_str(), lag_alias.c_str());
+            }
+
             /* Assert the LAG member exists */
             assert(lag.m_members.find(port_alias) != lag.m_members.end());
 
