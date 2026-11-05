@@ -2706,6 +2706,37 @@ namespace portsorch_test
         restoreDefaultEthernet0(consumer, children, defaultPortList);
     }
 
+    /*
+     * If the siblings are never deleted, the base port's removal only waits for
+     * the grace period, then goes ahead as before.
+     */
+    TEST_F(PortsOrchTest, PortBreakoutBaseRemovedAfterSiblingGrace)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        auto consumer = dynamic_cast<Consumer *>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        const vector<string> children = { "Ethernet100", "Ethernet101", "Ethernet102", "Ethernet103" };
+        map<sai_object_id_t, string> oidToAlias;
+
+        ASSERT_NO_FATAL_FAILURE(setupBreakoutChildren(consumer, portTable, defaultPortList, children, oidToAlias));
+        _ut_macro_ports.clear();
+        _ut_macro_base_port = SAI_NULL_OBJECT_ID;
+
+        Port base;
+        gPortsOrch->m_portRemovalSiblingGrace = std::chrono::milliseconds(200);
+        deletePorts(consumer, { "Ethernet100" });
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", base)) << "removed without waiting for its siblings";
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        EXPECT_FALSE(gPortsOrch->getPort("Ethernet100", base)) << "still waiting after the grace period";
+
+        Port p;
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet101", p));
+        gPortsOrch->m_portRemovalSiblingGrace = std::chrono::milliseconds(5000);
+
+        restoreDefaultEthernet0(consumer, { "Ethernet101", "Ethernet102", "Ethernet103" }, defaultPortList);
+    }
+
     TEST_F(PortsOrchTest, PortPTConfigDefaultTimestampTemplate)
     {
         auto portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);

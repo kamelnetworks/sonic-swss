@@ -2,6 +2,7 @@
 #define SWSS_PORTSORCH_H
 
 #include <map>
+#include <chrono>
 #include <unordered_set>
 
 #include "acltable.h"
@@ -440,6 +441,12 @@ private:
 
     void removePortFromLanesMap(string alias);
     void removePortFromPortListMap(sai_object_id_t port_id);
+    bool getPortLanes(sai_object_id_t port_id, set<uint32_t> &lanes) const;
+    bool getHigherLaneSibling(const string &alias, string &sibling) const;
+
+    /* Breakout siblings: removal of a port waits for them, see getHigherLaneSibling() */
+    map<string, std::chrono::steady_clock::time_point> m_portRemovalDeferredSince;
+    std::chrono::milliseconds m_portRemovalSiblingGrace = std::chrono::milliseconds(5000);
     void removeDefaultVlanMembers();
     void removeDefaultBridgePorts();
 

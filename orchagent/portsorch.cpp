@@ -4554,6 +4554,69 @@ void PortsOrch::removePortFromPortListMap(sai_object_id_t port_id)
     }
 }
 
+bool PortsOrch::getPortLanes(sai_object_id_t port_id, set<uint32_t> &lanes) const
+{
+    for (const auto &cit : m_portListLaneMap)
+    {
+        if (cit.second == port_id)
+        {
+            lanes = cit.first;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Some SAIs (Broadcom TD3) tear down a whole port macro when the port holding
+ * its first lane is removed, so removing the other ports of that macro fails
+ * afterwards (SAI_STATUS_INVALID_PORT_NUMBER) and their DEL is retried forever.
+ * `config interface breakout` deletes all child ports of a cage at once, and
+ * PortsOrch got them in key order, base port first, sometimes the base port on
+ * its own. Remove the children highest lane first instead: returns true (and the
+ * sibling's alias) while another existing port of the same front-panel port
+ * (same configured index) holds a higher first lane.
+ */
+bool PortsOrch::getHigherLaneSibling(const string &alias, string &sibling) const
+{
+    auto pit = m_portList.find(alias);
+    set<uint32_t> lanes;
+    if (pit == m_portList.end() || !getPortLanes(pit->second.m_port_id, lanes) || lanes.empty())
+    {
+        return false;
+    }
+
+    auto cit = m_lanesAliasSpeedMap.find(lanes);
+    if (cit == m_lanesAliasSpeedMap.end() || !cit->second.index.is_set)
+    {
+        return false;
+    }
+
+    const auto index = cit->second.index.value;
+    const auto first = *lanes.begin();
+
+    for (const auto &qit : m_portListLaneMap)
+    {
+        if (qit.first.empty() || *qit.first.begin() <= first)
+        {
+            continue;
+        }
+
+        auto qcfg = m_lanesAliasSpeedMap.find(qit.first);
+        if (qcfg == m_lanesAliasSpeedMap.end() || qcfg->second.key == alias ||
+            !qcfg->second.index.is_set || qcfg->second.index.value != index)
+        {
+            continue;
+        }
+
+        sibling = qcfg->second.key;
+        return true;
+    }
+
+    return false;
+}
+
 void PortsOrch::doSendToIngressPortTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -4688,6 +4751,8 @@ void PortsOrch::doPortTask(Consumer &consumer)
 
     auto &taskMap = consumer.m_toSync;
     auto it = taskMap.begin();
+    bool portRemovalDeferred = false;
+    bool portRemoved = false;
 
     while (it != taskMap.end())
     {
@@ -5788,6 +5853,35 @@ void PortsOrch::doPortTask(Consumer &consumer)
 
             const auto &alias = pCfg.key;
 
+            string sibling;
+            if (getHigherLaneSibling(alias, sibling))
+            {
+                const auto now = std::chrono::steady_clock::now();
+                auto since = m_portRemovalDeferredSince.emplace(alias, now);
+                if (!since.second && now - since.first->second > 3 * m_portRemovalSiblingGrace)
+                {
+                    // Left over from an earlier DEL of this port that was replaced: start again
+                    since.first->second = now;
+                    since.second = true;
+                }
+                if (now - since.first->second < m_portRemovalSiblingGrace)
+                {
+                    if (since.second)
+                    {
+                        SWSS_LOG_NOTICE("Deferring removal of port %s until %s (same front-panel port, higher lanes) is removed",
+                                        alias.c_str(), sibling.c_str());
+                    }
+                    portRemovalDeferred = true;
+                    it++;
+                    continue;
+                }
+
+                SWSS_LOG_WARN("Port %s still has %s (same front-panel port, higher lanes) after %lld ms, removing it anyway",
+                              alias.c_str(), sibling.c_str(),
+                              static_cast<long long>(m_portRemovalSiblingGrace.count()));
+            }
+            m_portRemovalDeferredSince.erase(alias);
+
             if (m_port_ref_count[alias] > 0)
             {
                 SWSS_LOG_WARN("Unable to remove port %s: ref count %u", alias.c_str(), m_port_ref_count[alias]);
@@ -5861,6 +5955,7 @@ void PortsOrch::doPortTask(Consumer &consumer)
             saiOidToAlias.erase(port_id);
 
             SWSS_LOG_NOTICE("Removed port %s", alias.c_str());
+            portRemoved = true;
         }
         else
         {
@@ -5868,6 +5963,15 @@ void PortsOrch::doPortTask(Consumer &consumer)
         }
 
         it = consumer.m_toSync.erase(it);
+    }
+
+    /*
+     * A port removal deferred for a sibling that has been removed since can go
+     * now. Each pass removes at least one port, so this ends.
+     */
+    if (portRemovalDeferred && portRemoved)
+    {
+        doPortTask(consumer);
     }
 }
 
