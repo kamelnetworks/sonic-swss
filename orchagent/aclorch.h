@@ -26,6 +26,8 @@
 #define MATCH_IN_PORTS          "IN_PORTS"
 #define MATCH_OUT_PORT          "OUT_PORT"
 #define MATCH_OUT_PORTS         "OUT_PORTS"
+#define MATCH_SRC_MAC           "SRC_MAC"
+#define MATCH_DST_MAC           "DST_MAC"
 #define MATCH_SRC_IP            "SRC_IP"
 #define MATCH_DST_IP            "DST_IP"
 #define MATCH_SRC_IP_MASK       "SRC_IP_MASK"

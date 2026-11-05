@@ -2696,6 +2696,143 @@ namespace aclorch_test
         ASSERT_TRUE(validateAclRuleByConfOp(*it_rule->second, kfvFieldsValues(kvfAclRule.front())));
     }
 
+    // Outer SRC_MAC/DST_MAC matches in a user-defined table type (kamelnetworks
+    // sonic-buildimage #169): exact match without a mask, "<mac>/<mask>" with one,
+    // malformed values rejected, and the match refused by a table type that does
+    // not list it.
+    TEST_F(AclOrchTest, Match_Outer_Mac)
+    {
+        const string aclTableTypeName = "IXP_L2";
+        const string aclTableName = "ACL-L2-IXP";
+        const string l3TableName = "L3_TABLE";
+
+        auto orch = createAclOrch();
+
+        orch->doAclTableTypeTask(
+            deque<KeyOpFieldsValuesTuple>(
+            {
+                {
+                    aclTableTypeName,
+                    SET_COMMAND,
+                    {
+                        { ACL_TABLE_TYPE_MATCHES, string(MATCH_SRC_MAC) + comma + MATCH_DST_MAC + comma + MATCH_IP_TYPE },
+                        { ACL_TABLE_TYPE_ACTIONS, ACTION_PACKET_ACTION },
+                        { ACL_TABLE_TYPE_BPOINT_TYPES, BIND_POINT_TYPE_PORT }
+                    }
+                }
+            })
+        );
+        ASSERT_TRUE(orch->getAclTableType(aclTableTypeName));
+
+        orch->doAclTableTask(
+            deque<KeyOpFieldsValuesTuple>(
+            {
+                {
+                    aclTableName,
+                    SET_COMMAND,
+                    {
+                        { ACL_TABLE_DESCRIPTION, "IXP Participants" },
+                        { ACL_TABLE_TYPE, aclTableTypeName },
+                        { ACL_TABLE_STAGE, STAGE_INGRESS },
+                        { ACL_TABLE_PORTS, "1,2" }
+                    }
+                },
+                {
+                    l3TableName,
+                    SET_COMMAND,
+                    {
+                        { ACL_TABLE_TYPE, TABLE_TYPE_L3 },
+                        { ACL_TABLE_STAGE, STAGE_INGRESS },
+                        { ACL_TABLE_PORTS, "1,2" }
+                    }
+                }
+            })
+        );
+        ASSERT_TRUE(orch->getAclTable(aclTableName));
+        ASSERT_TRUE(orch->getAclTable(l3TableName));
+
+        // The SAI table advertises the outer MAC fields
+        auto fvs = vector<FieldValueTuple>{
+            { "SAI_ACL_TABLE_ATTR_ACL_BIND_POINT_TYPE_LIST", "1:SAI_ACL_BIND_POINT_TYPE_PORT" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_SRC_MAC", "true" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_DST_MAC", "true" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_ACL_IP_TYPE", "true" },
+        };
+        ASSERT_TRUE(validateAclTable(
+            orch->getAclTable(aclTableName)->getOid(),
+            *orch->getAclTable(aclTableName),
+            make_shared<SaiAttributeList>(SAI_OBJECT_TYPE_ACL_TABLE, fvs, false))
+        );
+
+        auto setRule = [&](const string& table, const string& rule, const vector<FieldValueTuple>& matches)
+        {
+            vector<FieldValueTuple> values = { { RULE_PRIORITY, "10" } };
+            values.insert(values.end(), matches.begin(), matches.end());
+            orch->doAclRuleTask(deque<KeyOpFieldsValuesTuple>({ { table + "|" + rule, SET_COMMAND, values } }));
+        };
+        auto delRule = [&](const string& table, const string& rule)
+        {
+            orch->doAclRuleTask(deque<KeyOpFieldsValuesTuple>({ { table + "|" + rule, DEL_COMMAND, {} } }));
+            ASSERT_FALSE(orch->getAclRule(table, rule));
+        };
+
+        // Exact source MAC: the SONIX member permit rule
+        setRule(aclTableName, "PERMIT-525400d5cae0",
+                { { MATCH_SRC_MAC, "52:54:00:d5:ca:e0" }, { ACTION_PACKET_ACTION, PACKET_ACTION_FORWARD } });
+        auto rule = orch->getAclRule(aclTableName, "PERMIT-525400d5cae0");
+        ASSERT_TRUE(rule);
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_SRC_MAC),
+                  "52:54:00:D5:CA:E0&mask:FF:FF:FF:FF:FF:FF");
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION), "SAI_PACKET_ACTION_FORWARD");
+
+        // Catch-all drop in the same table
+        setRule(aclTableName, "DROP-OTHER-MAC",
+                { { MATCH_IP_TYPE, IP_TYPE_ANY }, { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+        ASSERT_TRUE(orch->getAclRule(aclTableName, "DROP-OTHER-MAC"));
+
+        // Destination MAC with a mask (IPv4 multicast range)
+        setRule(aclTableName, "DST-MASK",
+                { { MATCH_DST_MAC, "01:00:5e:00:00:00/ff:ff:ff:80:00:00" }, { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+        rule = orch->getAclRule(aclTableName, "DST-MASK");
+        ASSERT_TRUE(rule);
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_DST_MAC),
+                  "01:00:5E:00:00:00&mask:FF:FF:FF:80:00:00");
+
+        // Both outer MACs in one rule, upper-case input
+        setRule(aclTableName, "BOTH",
+                { { MATCH_SRC_MAC, "AA:BB:CC:DD:EE:FF" }, { MATCH_DST_MAC, "11:22:33:44:55:66/FF:FF:FF:FF:FF:00" },
+                  { ACTION_PACKET_ACTION, PACKET_ACTION_FORWARD } });
+        rule = orch->getAclRule(aclTableName, "BOTH");
+        ASSERT_TRUE(rule);
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_SRC_MAC),
+                  "AA:BB:CC:DD:EE:FF&mask:FF:FF:FF:FF:FF:FF");
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_DST_MAC),
+                  "11:22:33:44:55:66&mask:FF:FF:FF:FF:FF:00");
+
+        // Malformed values are rejected and no rule is created
+        for (const auto& bad : vector<string>{ "not-a-mac", "52:54:00:d5:ca", "52:54:00:d5:ca:e0:11",
+                                               "52:54:00:d5:ca:e0/", "52:54:00:d5:ca:e0/ff:ff", "a/b/c", "" })
+        {
+            setRule(aclTableName, "BAD", { { MATCH_SRC_MAC, bad }, { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+            ASSERT_FALSE(orch->getAclRule(aclTableName, "BAD")) << "accepted SRC_MAC \"" << bad << "\"";
+        }
+
+        // A table type that does not list SRC_MAC still refuses it
+        setRule(l3TableName, "L3-SRC-MAC",
+                { { MATCH_SRC_MAC, "52:54:00:d5:ca:e0" }, { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+        ASSERT_FALSE(orch->getAclRule(l3TableName, "L3-SRC-MAC"));
+
+        delRule(aclTableName, "PERMIT-525400d5cae0");
+        delRule(aclTableName, "DROP-OTHER-MAC");
+        delRule(aclTableName, "DST-MASK");
+        delRule(aclTableName, "BOTH");
+
+        orch->doAclTableTask(deque<KeyOpFieldsValuesTuple>(
+            { { aclTableName, DEL_COMMAND, {} }, { l3TableName, DEL_COMMAND, {} } }));
+        ASSERT_FALSE(orch->getAclTable(aclTableName));
+        ASSERT_FALSE(orch->getAclTable(l3TableName));
+    }
+
     TEST_F(AclOrchTest, AclInnerSourceMacRewriteTableValidation)
     {
         const string aclTableTypeName = "INNER_SRC_MAC_REWRITE_TABLE_TYPE";

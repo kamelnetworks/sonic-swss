@@ -63,6 +63,8 @@ acl_rule_attr_lookup_t aclMatchLookup =
     { MATCH_IN_PORTS,          SAI_ACL_ENTRY_ATTR_FIELD_IN_PORTS },
     { MATCH_OUT_PORT,          SAI_ACL_ENTRY_ATTR_FIELD_OUT_PORT },
     { MATCH_OUT_PORTS,         SAI_ACL_ENTRY_ATTR_FIELD_OUT_PORTS },
+    { MATCH_SRC_MAC,           SAI_ACL_ENTRY_ATTR_FIELD_SRC_MAC },
+    { MATCH_DST_MAC,           SAI_ACL_ENTRY_ATTR_FIELD_DST_MAC },
     { MATCH_SRC_IP,            SAI_ACL_ENTRY_ATTR_FIELD_SRC_IP },
     { MATCH_DST_IP,            SAI_ACL_ENTRY_ATTR_FIELD_DST_IP },
     { MATCH_SRC_IPV6,          SAI_ACL_ENTRY_ATTR_FIELD_SRC_IPV6 },
@@ -562,6 +564,21 @@ static bool parseIpv6Subnet(const string& value, sai_acl_field_data_t& matchData
     return true;
 }
 
+static bool parseMacAndMask(const string& value, sai_acl_field_data_t& matchData)
+{
+    auto slash = value.find('/');
+    if (slash == string::npos)
+    {
+        memset(matchData.mask.mac, 0xff, sizeof(sai_mac_t));
+        return MacAddress::parseMacString(value, matchData.data.mac);
+    }
+
+    // "<mac>/<mask>": both parts are full MAC addresses, nothing after the mask
+    return value.find('/', slash + 1) == string::npos &&
+           MacAddress::parseMacString(value.substr(0, slash), matchData.data.mac) &&
+           MacAddress::parseMacString(value.substr(slash + 1), matchData.mask.mac);
+}
+
 static sai_acl_table_attr_t AclEntryFieldToAclTableField(sai_acl_entry_attr_t attr)
 {
     if (!IS_ATTR_ID_IN_RANGE(attr, ACL_ENTRY, FIELD))
@@ -1045,6 +1062,17 @@ bool AclRule::validateAddMatch(string attr_name, string attr_value)
             swss::MacAddress mask(MAC_EXACT_MATCH);
             memcpy(matchData.data.mac, mac.getMac(), sizeof(sai_mac_t));
             memcpy(matchData.mask.mac, mask.getMac(), sizeof(sai_mac_t));
+        }
+        else if (attr_name == MATCH_SRC_MAC || attr_name == MATCH_DST_MAC)
+        {
+            // Outer MAC, "<mac>" or "<mac>/<mask>" as in the sonic-acl YANG
+            // mac-addr-and-mask type. Without a mask the match is exact.
+            if (!parseMacAndMask(attr_value, matchData))
+            {
+                SWSS_LOG_ERROR("Invalid %s %s, expected <mac> or <mac>/<mask>",
+                               attr_name.c_str(), attr_value.c_str());
+                return false;
+            }
         }
         else if (attr_name == MATCH_IN_PORTS)
         {

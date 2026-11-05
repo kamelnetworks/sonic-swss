@@ -707,6 +707,16 @@ Stores rules associated with a specific ACL table on the switch.
 
     ether_type    = h16                        ; Ethernet type field
 
+    src_mac       = mac_address ["/" mac_address]
+                                               ; outer source MAC, optionally with a
+                                               ; bitmask ("aa:bb:cc:dd:ee:ff/ff:ff:ff:00:00:00").
+                                               ; Exact match without a mask. The table's
+                                               ; type must list SRC_MAC in MATCHES.
+
+    dst_mac       = mac_address ["/" mac_address]
+                                               ; outer destination MAC, see src_mac.
+                                               ; The table's type must list DST_MAC.
+
     ip_type       = ip_types                   ; options of the l2_protocol_type
                                                ; field.
 
