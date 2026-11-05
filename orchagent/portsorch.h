@@ -443,10 +443,17 @@ private:
     void removePortFromPortListMap(sai_object_id_t port_id);
     bool getPortLanes(sai_object_id_t port_id, set<uint32_t> &lanes) const;
     bool getHigherLaneSibling(const string &alias, string &sibling) const;
+    bool isPortLanesUnchanged(sai_object_id_t port_id, const vector<FieldValueTuple> &fvs) const;
 
     /* Breakout siblings: removal of a port waits for them, see getHigherLaneSibling() */
-    map<string, std::chrono::steady_clock::time_point> m_portRemovalDeferredSince;
-    std::chrono::milliseconds m_portRemovalSiblingGrace = std::chrono::milliseconds(5000);
+    struct PortRemovalDeferral
+    {
+        std::chrono::steady_clock::time_point since;
+        bool reported;
+    };
+    map<string, PortRemovalDeferral> m_portRemovalDeferred;
+    /* A removal deferred this long is logged as an error; it is still never forced */
+    std::chrono::milliseconds m_portRemovalSiblingReportAfter = std::chrono::milliseconds(5000);
     void removeDefaultVlanMembers();
     void removeDefaultBridgePorts();
 

@@ -4568,6 +4568,41 @@ bool PortsOrch::getPortLanes(sai_object_id_t port_id, set<uint32_t> &lanes) cons
     return false;
 }
 
+// True if the SET fields give the lanes the port has now (a re-add of the port, not an attribute update)
+bool PortsOrch::isPortLanesUnchanged(sai_object_id_t port_id, const vector<FieldValueTuple> &fvs) const
+{
+    set<uint32_t> lanes;
+    if (!getPortLanes(port_id, lanes))
+    {
+        return false;
+    }
+
+    for (const auto &fv : fvs)
+    {
+        if (fvField(fv) != "lanes")
+        {
+            continue;
+        }
+
+        set<uint32_t> want;
+        try
+        {
+            for (const auto &lane : tokenize(fvValue(fv), ','))
+            {
+                want.insert(static_cast<uint32_t>(std::stoul(lane)));
+            }
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
+
+        return want == lanes;
+    }
+
+    return false;
+}
+
 /*
  * Some SAIs (Broadcom TD3) tear down a whole port macro when the port holding
  * its first lane is removed, so removing the other ports of that macro fails
@@ -5847,40 +5882,64 @@ void PortsOrch::doPortTask(Consumer &consumer)
             {
                 SWSS_LOG_ERROR("Failed to remove port: alias %s doesn't exist", pCfg.key.c_str());
                 m_portConfigMap.erase(pCfg.key);
+                m_portRemovalDeferred.erase(pCfg.key);
                 it = taskMap.erase(it);
                 continue;
             }
 
             const auto &alias = pCfg.key;
 
+            /*
+             * Never remove a port while a higher-lane sibling exists: on TD3 that
+             * tears the macro down under the sibling, however long we waited. A
+             * DEL of the base port alone (its siblings are never deleted) is not
+             * supported, so it stays pending, with an error, until they are gone,
+             * or until the port is set again with the same lanes, which cancels
+             * it. Other later tasks of the same port wait behind its DEL.
+             */
             string sibling;
             if (getHigherLaneSibling(alias, sibling))
             {
-                const auto now = std::chrono::steady_clock::now();
-                auto since = m_portRemovalDeferredSince.emplace(alias, now);
-                if (!since.second && now - since.first->second > 3 * m_portRemovalSiblingGrace)
+                auto next = std::next(it);
+                if (next != taskMap.end() && next->first == alias && kfvOp(next->second) == SET_COMMAND &&
+                    isPortLanesUnchanged(p.m_port_id, kfvFieldsValues(next->second)))
                 {
-                    // Left over from an earlier DEL of this port that was replaced: start again
-                    since.first->second = now;
-                    since.second = true;
-                }
-                if (now - since.first->second < m_portRemovalSiblingGrace)
-                {
-                    if (since.second)
-                    {
-                        SWSS_LOG_NOTICE("Deferring removal of port %s until %s (same front-panel port, higher lanes) is removed",
-                                        alias.c_str(), sibling.c_str());
-                    }
-                    portRemovalDeferred = true;
-                    it++;
+                    SWSS_LOG_NOTICE("Cancelling the pending removal of port %s: it was set again with the same lanes",
+                                    alias.c_str());
+                    m_portRemovalDeferred.erase(alias);
+                    it = taskMap.erase(it);
                     continue;
                 }
 
-                SWSS_LOG_WARN("Port %s still has %s (same front-panel port, higher lanes) after %lld ms, removing it anyway",
-                              alias.c_str(), sibling.c_str(),
-                              static_cast<long long>(m_portRemovalSiblingGrace.count()));
+                const auto now = std::chrono::steady_clock::now();
+                auto deferral = m_portRemovalDeferred.emplace(alias, PortRemovalDeferral{ now, false });
+                if (deferral.second)
+                {
+                    SWSS_LOG_NOTICE("Deferring removal of port %s until %s (same front-panel port, higher lanes) is removed",
+                                    alias.c_str(), sibling.c_str());
+                }
+                else if (!deferral.first->second.reported &&
+                         now - deferral.first->second.since >= m_portRemovalSiblingReportAfter)
+                {
+                    SWSS_LOG_ERROR("Not removing port %s: %s (same front-panel port, higher lanes) still exists after %lld ms, "
+                                   "and removing %s first would tear down the port macro under it. "
+                                   "Delete the other ports of this front-panel port; %s is removed after them",
+                                   alias.c_str(), sibling.c_str(),
+                                   static_cast<long long>(m_portRemovalSiblingReportAfter.count()),
+                                   alias.c_str(), alias.c_str());
+                    deferral.first->second.reported = true;
+                }
+                portRemovalDeferred = true;
+                while (it != taskMap.end() && it->first == alias)
+                {
+                    it++;
+                }
+                continue;
             }
-            m_portRemovalDeferredSince.erase(alias);
+            if (m_portRemovalDeferred.erase(alias))
+            {
+                SWSS_LOG_NOTICE("Removing port %s: no other port of its front-panel port with higher lanes is left", alias.c_str());
+            }
 
             if (m_port_ref_count[alias] > 0)
             {

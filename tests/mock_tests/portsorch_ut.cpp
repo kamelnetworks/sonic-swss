@@ -2707,10 +2707,13 @@ namespace portsorch_test
     }
 
     /*
-     * If the siblings are never deleted, the base port's removal only waits for
-     * the grace period, then goes ahead as before.
+     * Waiting never makes it safe to remove the base port under its siblings.
+     * Its DEL on its own stays pending past the old grace period (setting the
+     * port again cancels it), and so do lower siblings while a higher one's DEL
+     * is blocked by a reference (as a router interface holds it). Once that
+     * reference goes, the whole group is removed highest lane first.
      */
-    TEST_F(PortsOrchTest, PortBreakoutBaseRemovedAfterSiblingGrace)
+    TEST_F(PortsOrchTest, PortBreakoutBaseNeverRemovedBeforeSiblings)
     {
         Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
         auto consumer = dynamic_cast<Consumer *>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
@@ -2718,23 +2721,77 @@ namespace portsorch_test
         map<sai_object_id_t, string> oidToAlias;
 
         ASSERT_NO_FATAL_FAILURE(setupBreakoutChildren(consumer, portTable, defaultPortList, children, oidToAlias));
-        _ut_macro_ports.clear();
-        _ut_macro_base_port = SAI_NULL_OBJECT_ID;
 
-        Port base;
-        gPortsOrch->m_portRemovalSiblingGrace = std::chrono::milliseconds(200);
-        deletePorts(consumer, { "Ethernet100" });
-        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", base)) << "removed without waiting for its siblings";
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        static_cast<Orch *>(gPortsOrch)->doTask();
-        EXPECT_FALSE(gPortsOrch->getPort("Ethernet100", base)) << "still waiting after the grace period";
+        _hook_sai_port_api();
+        ut_sai_port_api.remove_port = _ut_stub_sai_remove_port_macro;
+        const auto reportAfter = gPortsOrch->m_portRemovalSiblingReportAfter;
+        gPortsOrch->m_portRemovalSiblingReportAfter = std::chrono::milliseconds(200);
 
         Port p;
-        EXPECT_TRUE(gPortsOrch->getPort("Ethernet101", p));
-        gPortsOrch->m_portRemovalSiblingGrace = std::chrono::milliseconds(5000);
+        deletePorts(consumer, { "Ethernet100" });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", p)) << "base port removed while its siblings exist";
+        EXPECT_TRUE(_ut_removed_ports.empty());
+        EXPECT_FALSE(_ut_macro_torn_down);
+        EXPECT_TRUE(gPortsOrch->m_portRemovalDeferred.at("Ethernet100").reported);
 
-        restoreDefaultEthernet0(consumer, { "Ethernet101", "Ethernet102", "Ethernet103" }, defaultPortList);
+        // Setting the base port again with its lanes cancels its pending DEL.
+        string parentLanes;
+        for (const auto &fv : defaultPortList.at("Ethernet0"))
+        {
+            if (fvField(fv) == "lanes")
+            {
+                parentLanes = fvValue(fv);
+            }
+        }
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({ "Ethernet100", SET_COMMAND, {
+            { "lanes", tokenize(parentLanes, ',')[0] }, { "index", "1" }, { "speed", "1000" }, { "mtu", "6000" }, { "admin_status", "up" }
+        } });
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", p));
+        EXPECT_EQ(gPortsOrch->m_portRemovalDeferred.count("Ethernet100"), 0u);
+        EXPECT_EQ(consumer->m_toSync.count("Ethernet100"), 0u);
+        EXPECT_TRUE(_ut_removed_ports.empty());
+
+        // The whole group, with Ethernet102 held by a reference.
+        gPortsOrch->increasePortRefCount("Ethernet102");
+        deletePorts(consumer, children);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        for (const auto &alias : { "Ethernet100", "Ethernet101", "Ethernet102" })
+        {
+            EXPECT_TRUE(gPortsOrch->getPort(alias, p)) << alias << " removed while Ethernet102 is held";
+        }
+        EXPECT_FALSE(gPortsOrch->getPort("Ethernet103", p));
+        EXPECT_FALSE(_ut_macro_torn_down);
+
+        gPortsOrch->decreasePortRefCount("Ethernet102");
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        _unhook_sai_port_api();
+        gPortsOrch->m_portRemovalSiblingReportAfter = reportAfter;
+
+        vector<string> removed;
+        for (const auto &oid : _ut_removed_ports)
+        {
+            removed.push_back(oidToAlias[oid]);
+        }
+        const vector<string> expected = { "Ethernet103", "Ethernet102", "Ethernet101", "Ethernet100" };
+        EXPECT_EQ(removed, expected);
+        EXPECT_FALSE(_ut_macro_torn_down);
+        EXPECT_TRUE(gPortsOrch->m_portRemovalDeferred.empty());
+
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        for (const auto &task : taskList)
+        {
+            EXPECT_EQ(task.find("Ethernet10"), std::string::npos) << task;
+        }
+
+        restoreDefaultEthernet0(consumer, children, defaultPortList);
     }
 
     TEST_F(PortsOrchTest, PortPTConfigDefaultTimestampTemplate)
