@@ -633,7 +633,9 @@ private:
     auto getPortConfigState() const -> port_config_state_t;
     void setPortConfigState(port_config_state_t value);
 
-    bool addPortBulk(const std::vector<PortConfig> &portList, std::vector<Port>& addedPorts);
+    bool addPortBulk(const std::vector<PortConfig> &portList, std::vector<Port>& addedPorts,
+                     std::map<std::string, task_process_status> *failedPorts = nullptr);
+    bool addPortWithRetry(Consumer &consumer, SyncMap::iterator &it, const PortConfig &pCfg);
     bool removePortBulk(const std::vector<sai_object_id_t> &portList);
 
     /* Prototypes for Path Tracing */

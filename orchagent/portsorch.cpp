@@ -1300,7 +1300,8 @@ void PortsOrch::setPortConfigState(port_config_state_t value)
     this->m_portConfigState = value;
 }
 
-bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector<Port>& addedPorts)
+bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector<Port>& addedPorts,
+                            std::map<std::string, task_process_status> *failedPorts)
 {
     // The method is used to create ports in a bulk mode.
     // The action takes place when:
@@ -1505,32 +1506,54 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to create ports with bulk operation, rv:%d", status);
-
-        auto handle_status = handleSaiCreateStatus(SAI_API_PORT, status);
-        if (handle_status != task_process_status::task_success)
-        {
-            SWSS_LOG_THROW("PortsOrch bulk create failure");
-        }
-
-        return false;
     }
+
+    /*
+     * The SAI may refuse some ports of the bulk and create the rest, e.g. a
+     * breakout mode the ASIC can't do. Keep the created ports and report the
+     * refused ones to the caller instead of throwing: an exception here leaves
+     * the task to be retried forever, and at init it also leaks the ports that
+     * were created.
+     */
+    std::vector<Port> createdPorts;
+    std::vector<sai_object_id_t> createdOids;
 
     for (std::uint32_t i = 0; i < portCount; i++)
     {
-        if (statusList.at(i) != SAI_STATUS_SUCCESS)
+        auto portStatus = statusList.at(i);
+
+        // A bulk call that failed as a whole may leave the statuses untouched
+        if (portStatus == SAI_STATUS_SUCCESS && oidList.at(i) == SAI_NULL_OBJECT_ID)
         {
+            portStatus = (status != SAI_STATUS_SUCCESS) ? status : SAI_STATUS_FAILURE;
+        }
+
+        if (portStatus != SAI_STATUS_SUCCESS)
+        {
+            const auto &key = portList.at(i).key;
+
             SWSS_LOG_ERROR(
                 "Failed to create port %s with bulk operation, rv:%d",
-                portList.at(i).key.c_str(), statusList.at(i)
+                key.c_str(), portStatus
             );
 
-            auto handle_status = handleSaiCreateStatus(SAI_API_PORT, statusList.at(i));
-            if (handle_status != task_process_status::task_success)
+            auto handle_status = handleSaiCreateStatus(SAI_API_PORT, portStatus);
+            if (failedPorts != nullptr)
             {
-                SWSS_LOG_THROW("PortsOrch bulk create failure");
+                (*failedPorts)[key] = handle_status == task_process_status::task_success ?
+                    task_process_status::task_failed : handle_status;
             }
 
-            return false;
+            if (m_portPtTam.erase(key) > 0)
+            {
+                m_ptTamRefCount--;
+                if (m_ptTamRefCount == 0 && !removePtTam(m_ptTam))
+                {
+                    SWSS_LOG_ERROR("Failed to remove TAM object for Path Tracing");
+                }
+            }
+
+            continue;
         }
 
         Port& p = addedPorts.at(i);
@@ -1544,6 +1567,16 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
         m_portListLaneMap[portList.at(i).lanes.value] = oidList.at(i);
         addedPorts.at(i).m_port_id = oidList.at(i);
         m_portCount++;
+
+        createdPorts.push_back(addedPorts.at(i));
+        createdOids.push_back(oidList.at(i));
+    }
+
+    addedPorts.swap(createdPorts);
+
+    if (addedPorts.empty())
+    {
+        return false;
     }
 
     // newly created ports might be put in the default vlan so remove all ports from
@@ -1553,9 +1586,9 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
         removeDefaultBridgePorts();
     }
 
-    SWSS_LOG_NOTICE("Created ports: %s", swss::join(',', oidList.begin(), oidList.end()).c_str());
+    SWSS_LOG_NOTICE("Created ports: %s", swss::join(',', createdOids.begin(), createdOids.end()).c_str());
 
-    return true;
+    return addedPorts.size() == portCount;
 }
 
 bool PortsOrch::removePortBulk(const std::vector<sai_object_id_t> &portList)
@@ -4682,6 +4715,48 @@ bool PortsOrch::programSerdes(
     }
 }
 
+/*
+ * Create and initialize one port at runtime, e.g. a child port of a breakout.
+ * On failure the task iterator is advanced: kept for a retry if the SAI asked
+ * for one, otherwise dropped. A port the SAI refuses (a breakout mode the ASIC
+ * can't do) stays absent from ASIC_DB and is reported in the log and through
+ * the response publisher; its row stays in APPL_DB until it is removed or fixed.
+ */
+bool PortsOrch::addPortWithRetry(Consumer &consumer, SyncMap::iterator &it, const PortConfig &pCfg)
+{
+    SWSS_LOG_ENTER();
+
+    std::vector<PortConfig> portsToAddList { pCfg };
+    std::vector<Port> addedPorts;
+    std::map<std::string, task_process_status> failedPorts;
+
+    if (addPortBulk(portsToAddList, addedPorts, &failedPorts))
+    {
+        initPortsBulk(addedPorts);
+        return true;
+    }
+
+    if (failedPorts[pCfg.key] == task_process_status::task_need_retry)
+    {
+        SWSS_LOG_ERROR("Failed to add port %s, will retry", pCfg.key.c_str());
+        it++;
+        return false;
+    }
+
+    SWSS_LOG_ERROR("Failed to add port %s (lanes %s, speed %u): refused by the SAI, port not created",
+                   pCfg.key.c_str(), swss::join(',', pCfg.lanes.value.begin(), pCfg.lanes.value.end()).c_str(),
+                   pCfg.speed.value);
+
+    m_publisher.publish(consumer.getTableName(), pCfg.key, kfvFieldsValues(it->second),
+                        ReturnCode(StatusCode::SWSS_RC_INVALID_PARAM) << "Port create refused by the SAI");
+
+    removePortFromLanesMap(pCfg.key);
+    m_portConfigMap.erase(pCfg.key);
+    m_pendingPortSet.erase(pCfg.key);
+    it = consumer.m_toSync.erase(it);
+    return false;
+}
+
 void PortsOrch::doPortTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -4880,32 +4955,45 @@ void PortsOrch::doPortTask(Consumer &consumer)
                 if (!portsToAddList.empty())
                 {
                     std::vector<Port> addedPorts;
-                    if (!addPortBulk(portsToAddList, addedPorts))
+                    std::map<std::string, task_process_status> failedPorts;
+                    if (!addPortBulk(portsToAddList, addedPorts, &failedPorts))
                     {
-                        SWSS_LOG_THROW("PortsOrch initialization failure");
+                        // Bring up the ports the SAI created instead of
+                        // failing init, so one refused row can't keep swss
+                        // down. The other refused ports' tasks retry them one
+                        // by one below and drop them if they fail again.
+                        SWSS_LOG_ERROR("%zu of %zu ports were not created at init",
+                                       failedPorts.size(), portsToAddList.size());
+                        for (const auto &failed : failedPorts)
+                        {
+                            removePortFromLanesMap(failed.first);
+                        }
                     }
 
                     initPortsBulk(addedPorts);
                 }
 
                 setPortConfigState(PORT_CONFIG_DONE);
+
+                if (m_portList.count(key) == 0)
+                {
+                    // This port's create was refused or needs a retry
+                    m_lanesAliasSpeedMap[pCfg.lanes.value] = pCfg;
+                    if (!addPortWithRetry(consumer, it, pCfg))
+                    {
+                        continue;
+                    }
+                }
             }
             else if (getPortConfigState() == PORT_CONFIG_DONE)
             {
                 // Add and initialize the port
                 if (!portExists)
                 {
-                    std::vector<PortConfig> portsToAddList { pCfg };
-                    std::vector<Port> addedPorts;
-
-                    if (!addPortBulk(portsToAddList, addedPorts))
+                    if (!addPortWithRetry(consumer, it, pCfg))
                     {
-                        SWSS_LOG_ERROR("Failed to add port %s", pCfg.key.c_str());
-                        it++;
                         continue;
                     }
-
-                    initPortsBulk(addedPorts);
                 }
             }
             else
