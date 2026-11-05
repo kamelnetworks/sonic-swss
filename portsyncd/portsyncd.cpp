@@ -28,7 +28,8 @@ using namespace swss;
  * initialized, we check the database to see if some of the ports' host
  * interfaces are already created and remove them from this set. We will
  * remove the rest of the ports in the set when receiving the first netlink
- * message indicating that the host interfaces are created. After the set
+ * message indicating that the host interfaces are created, and those
+ * orchagent failed to create (see LinkSync::checkPortInitDone). After the set
  * is empty, we send out the signal PortInitDone. g_init is used to limit the
  * command to be run only once.
  */
@@ -109,6 +110,8 @@ int main(int argc, char **argv)
             }
             else if (ret == Select::TIMEOUT)
             {
+                /* a port orchagent failed to create may be all we still wait for */
+                sync.checkPortInitDone();
                 continue;
             }
             else if (ret != Select::OBJECT)
@@ -120,22 +123,7 @@ int main(int argc, char **argv)
             if (temps == static_cast<Selectable*>(&netlink))
             {
                 /* on netlink message, check if PortInitDone should be sent out */
-                if (!g_init && g_portSet.empty())
-                {
-                    /*
-                     * After finishing reading port configuration file and
-                     * creating all host interfaces, this daemon shall send
-                     * out a signal to orchagent indicating port initialization
-                     * procedure is done and other application could start
-                     * syncing.
-                     */
-                    FieldValueTuple finish_notice("lanes", "0");
-                    vector<FieldValueTuple> attrs = { finish_notice };
-                    p.set("PortInitDone", attrs);
-                    SWSS_LOG_NOTICE("PortInitDone");
-
-                    g_init = true;
-                }
+                sync.checkPortInitDone();
             }
             else
             {

@@ -5,6 +5,7 @@
 #include "producerstatetable.h"
 #include "netmsg.h"
 
+#include <chrono>
 #include <map>
 
 namespace swss {
@@ -18,12 +19,17 @@ public:
 
     virtual void onMsg(int nlmsg_type, struct nl_object *obj);
 
+    /* Send PortInitDone once every port's netdev is created or its create failed */
+    void checkPortInitDone();
+
 private:
     ProducerStateTable m_portTableProducer;
     Table m_portTable, m_statePortTable;
 
     std::map<unsigned int, std::string> m_ifindexNameMap;
     std::map<unsigned int, std::string> m_ifindexOldNameMap;
+
+    std::chrono::steady_clock::time_point m_lastCreateFailedCheck;
 };
 
 }
