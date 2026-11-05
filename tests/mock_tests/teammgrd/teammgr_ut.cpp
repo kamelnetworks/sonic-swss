@@ -532,12 +532,20 @@ namespace teammgr_ut
     }
     /* Kernel master reported by "ip -o link show dev <port>" in the tests below */
     static std::string mock_port_master;
+    /* Nonzero: "ip -o link show dev <port>" fails with this status and prints mock_link_show_err */
+    static int mock_link_show_rc = 0;
+    static std::string mock_link_show_err;
 
     static int cb_lag_member(const std::string &cmd, std::string &stdout)
     {
         if (cmd.find("/sbin/ip -o link show dev") != std::string::npos)
         {
             mockCallArgs.push_back(cmd);
+            if (mock_link_show_rc != 0)
+            {
+                stdout = mock_link_show_err;
+                return mock_link_show_rc;
+            }
             stdout = "47: Ethernet0: <BROADCAST,MULTICAST> mtu 9100 qdisc noop ";
             if (!mock_port_master.empty())
             {
@@ -676,6 +684,58 @@ namespace teammgr_ut
         mock_port_master = "PortChannel99";
         teammgr.addExistingData(&cfg_lag_member_table);
         teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* Review of kamelnetworks/sonic-swss#2: when the port's kernel master can't be
+     * read it may still be in the bridge, so it is not enslaved on a guess; the
+     * member is retried and added once the lookup works. */
+    TEST_F(TeamMgrTest, testLagMemberDeferredWhenMasterLookupFails)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "";
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Cannot send link get request: No buffer space available\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/sbin/ip -o link show dev"));
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 1);   /* kept for retry, not ignored */
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port add \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* A port that does not exist is still ignored, as before */
+    TEST_F(TeamMgrTest, testLagMemberIgnoredWhenPortDoesNotExist)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Device \"Ethernet0\" does not exist.\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        mock_link_show_rc = 0;
         EXPECT_FALSE(commandSeen("port add"));
         auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
         ASSERT_NE(consumer, nullptr);

@@ -35,20 +35,33 @@ static inline std::string shellquote(const std::string& str)
     return "\"" + std::regex_replace(str, re, "\\$1") + "\"";
 }
 
+/* Outcome of getNetdevMaster() */
+enum class NetdevMasterLookup
+{
+    FOUND,      /* master holds the master device, or is empty if there is none */
+    NO_DEVICE,  /* the netdev does not exist */
+    FAILED,     /* "ip link show" failed for another reason: the state is unknown */
+};
+
 /*
  * Look up the kernel master (the Dot1Q bridge or a port channel) of a netdev.
- * Returns false if the netdev does not exist. On success, master is the name
- * of the master device, or empty if the netdev has none.
+ * Only FOUND and NO_DEVICE describe the kernel state; on FAILED the caller must
+ * not assume anything about the netdev and should retry later.
  */
-static inline bool getNetdevMaster(const std::string& dev, std::string& master)
+static inline NetdevMasterLookup getNetdevMaster(const std::string& dev, std::string& master)
 {
     std::string res;
-    std::string cmd = IP_CMD " -o link show dev " + shellquote(dev);
+    std::string cmd = IP_CMD " -o link show dev " + shellquote(dev) + " 2>&1";
 
     master.clear();
     if (swss::exec(cmd, res) != 0)
     {
-        return false;
+        /* iproute2: Device "<dev>" does not exist. */
+        if (res.find("does not exist") != std::string::npos)
+        {
+            return NetdevMasterLookup::NO_DEVICE;
+        }
+        return NetdevMasterLookup::FAILED;
     }
 
     static const std::regex re("\\bmaster (\\S+)");
@@ -57,7 +70,7 @@ static inline bool getNetdevMaster(const std::string& dev, std::string& master)
     {
         master = m[1];
     }
-    return true;
+    return NetdevMasterLookup::FOUND;
 }
 
 #endif /* __SHELLCMD__ */

@@ -887,10 +887,23 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
 
     // If port was already deleted, ignore this operation
     string master;
-    if (!getNetdevMaster(member, master))
+    auto lookup = getNetdevMaster(member, master);
+    if (lookup == NetdevMasterLookup::NO_DEVICE)
     {
         SWSS_LOG_WARN("Unable to find port %s", member.c_str());
         return task_ignore;
+    }
+
+    // The port's kernel master could not be read, so it may still be in the
+    // bridge: don't enslave it on a guess, retry instead.
+    if (lookup == NetdevMasterLookup::FAILED)
+    {
+        if (m_deferredLagMembers.insert(member).second)
+        {
+            SWSS_LOG_WARN("Unable to look up the kernel master of port %s, deferring adding it to port channel %s",
+                          member.c_str(), lag.c_str());
+        }
+        return task_need_retry;
     }
 
     // If port is already enslaved by this port channel, ignore this operation
@@ -1001,7 +1014,7 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
 
     if (m_deferredLagMembers.erase(member))
     {
-        SWSS_LOG_NOTICE("Port %s is no longer a VLAN member, adding the deferred member to port channel %s",
+        SWSS_LOG_NOTICE("Adding the deferred member %s to port channel %s",
                         member.c_str(), lag.c_str());
     }
     SWSS_LOG_NOTICE("Add %s to port channel %s", member.c_str(), lag.c_str());

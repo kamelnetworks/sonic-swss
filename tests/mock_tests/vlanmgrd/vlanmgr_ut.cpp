@@ -26,12 +26,23 @@ namespace vlanmgr_ut
     static string mock_port_master;
     /* Exit status of the "bridge vlan del ..." command */
     static int mock_bridge_vlan_del_rc;
+    /* Nonzero: "ip -o link show dev <port>" fails with this status and prints mock_link_show_err */
+    static int mock_link_show_rc;
+    static string mock_link_show_err;
+
+    static const string LINK_SHOW_NO_DEVICE = "Device \"" + PORT + "\" does not exist.\n";
+    static const string LINK_SHOW_FAILED = "Cannot send link get request: No buffer space available\n";
 
     static int cb(const string &cmd, string &stdout)
     {
         mockCallArgs.push_back(cmd);
         if (cmd.find("/sbin/ip -o link show dev") != string::npos)
         {
+            if (mock_link_show_rc != 0)
+            {
+                stdout = mock_link_show_err;
+                return mock_link_show_rc;
+            }
             stdout = "47: " + PORT + ": <BROADCAST,MULTICAST> mtu 9100 qdisc noop ";
             if (!mock_port_master.empty())
             {
@@ -86,6 +97,8 @@ namespace vlanmgr_ut
             mockCallArgs.clear();
             mock_port_master.clear();
             mock_bridge_vlan_del_rc = 0;
+            mock_link_show_rc = 0;
+            mock_link_show_err.clear();
             callback = cb;
 
             /* Same table lists as vlanmgrd.cpp */
@@ -257,5 +270,92 @@ namespace vlanmgr_ut
 
         EXPECT_EQ(m_memberConsumer->m_toSync.size(), 1);
         EXPECT_TRUE(memberPublished());
+    }
+
+    /* Review of kamelnetworks/sonic-swss#2: a failed master lookup is not proof
+     * that the port left the bridge. When both "bridge vlan del" and the lookup
+     * fail, the removal is retried and the published membership is kept; the
+     * retry then completes it. */
+    TEST_F(VlanMgrTest, MemberDeleteRetriedWhenMasterLookupFails)
+    {
+        configureMember();
+        m_vlanMgr->doTask();
+        ASSERT_TRUE(memberPublished());
+
+        mock_bridge_vlan_del_rc = 1;
+        mock_link_show_rc = 1;
+        mock_link_show_err = LINK_SHOW_FAILED;
+        m_memberConsumer->addToSync(KeyOpFieldsValuesTuple{ CFG_KEY, DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        m_vlanMgr->doTask();
+
+        EXPECT_TRUE(commandSeen("bridge vlan del vid 3999"));
+        EXPECT_TRUE(commandSeen("/sbin/ip -o link show dev"));
+        EXPECT_EQ(m_memberConsumer->m_toSync.size(), 1);
+        EXPECT_TRUE(memberPublished());
+        vector<FieldValueTuple> fvs;
+        EXPECT_TRUE(m_stateVlanMemberTable->get(CFG_KEY, fvs));
+        EXPECT_FALSE(m_vlanMgr->m_PortVlanMember[PORT].empty());
+
+        /* The kernel recovers: the retry removes the member */
+        mock_bridge_vlan_del_rc = 0;
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        m_vlanMgr->doTask();
+        EXPECT_TRUE(commandSeen("bridge vlan del vid 3999"));
+        EXPECT_EQ(m_memberConsumer->m_toSync.size(), 0);
+        EXPECT_FALSE(memberPublished());
+        EXPECT_FALSE(m_stateVlanMemberTable->get(CFG_KEY, fvs));
+        EXPECT_TRUE(m_vlanMgr->m_PortVlanMember[PORT].empty());
+    }
+
+    /* A port that no longer exists has no kernel VLAN membership left: the
+     * failed "bridge vlan del" finishes the removal instead of looping */
+    TEST_F(VlanMgrTest, MemberDeleteFinishesWhenPortIsGone)
+    {
+        configureMember();
+        m_vlanMgr->doTask();
+        ASSERT_TRUE(memberPublished());
+
+        mock_bridge_vlan_del_rc = 1;
+        mock_link_show_rc = 1;
+        mock_link_show_err = LINK_SHOW_NO_DEVICE;
+        m_memberConsumer->addToSync(KeyOpFieldsValuesTuple{ CFG_KEY, DEL_COMMAND, {} });
+        m_vlanMgr->doTask();
+
+        EXPECT_EQ(m_memberConsumer->m_toSync.size(), 0);
+        EXPECT_FALSE(memberPublished());
+    }
+
+    /* The add side: with no PORTCHANNEL_MEMBER row left, a failed master lookup
+     * must not let vlanmgrd pull a port that may still be in a port channel
+     * into the bridge. The member is deferred and added once the lookup works. */
+    TEST_F(VlanMgrTest, MemberDeferredWhenMasterLookupFails)
+    {
+        mock_link_show_rc = 1;
+        mock_link_show_err = LINK_SHOW_FAILED;
+        configureMember();
+        m_vlanMgr->doTask();
+
+        EXPECT_TRUE(commandSeen("/sbin/ip -o link show dev"));
+        EXPECT_FALSE(commandSeen("master Bridge"));
+        EXPECT_FALSE(memberPublished());
+        EXPECT_EQ(m_memberConsumer->m_toSync.size(), 1);
+        EXPECT_EQ(m_vlanMgr->m_deferredVlanMembers.count(CFG_KEY), 1);
+
+        /* Still unknown: still deferred */
+        mockCallArgs.clear();
+        m_vlanMgr->doTask();
+        EXPECT_FALSE(commandSeen("master Bridge"));
+        EXPECT_EQ(m_memberConsumer->m_toSync.size(), 1);
+
+        /* The lookup works and the port has no master: it is added */
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        m_vlanMgr->doTask();
+        EXPECT_TRUE(commandSeen("master Bridge"));
+        EXPECT_TRUE(memberPublished());
+        EXPECT_EQ(m_memberConsumer->m_toSync.size(), 0);
+        EXPECT_TRUE(m_vlanMgr->m_deferredVlanMembers.empty());
     }
 }
