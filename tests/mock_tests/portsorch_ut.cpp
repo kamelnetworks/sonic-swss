@@ -161,6 +161,7 @@ namespace portsorch_test
     uint32_t _sai_set_pfc_mode_count;
     uint32_t _sai_set_admin_state_up_count;
     uint32_t _sai_set_admin_state_down_count;
+    uint32_t _sai_admin_state_up_count_at_fec_set;
     bool set_pt_interface_id_fail = false;
     bool set_pt_timestamp_template_fail = false;
     bool set_port_tam_fail = false;
@@ -193,6 +194,7 @@ namespace portsorch_test
         {
             _sai_set_port_fec_count++;
             _sai_port_fec_mode = attr[0].value.s32;
+            _sai_admin_state_up_count_at_fec_set = _sai_set_admin_state_up_count;
         }
         else if (attr[0].id == SAI_PORT_ATTR_AUTO_NEG_MODE)
         {
@@ -1336,6 +1338,72 @@ namespace portsorch_test
                 _sai_set_pfc_mode_count == sai_set_pfc_mode_count + 1);
 
         // Cleanup ports
+        cleanupPorts(gPortsOrch);
+    }
+
+    // A port created at runtime (DPB, or a saved breakout at boot) must also get its
+    // FEC mode through set_port_attribute(): Broadcom's SAI (TD3) ignores
+    // SAI_PORT_ATTR_FEC_MODE on create_port() for dynamically created ports (#171).
+    // The set has to happen before the port is brought admin up, so no extra bounce.
+    TEST_F(PortsOrchTest, PortFecSetAfterCreation)
+    {
+        auto portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+
+        const auto alias = "Ethernet0";
+
+        auto &ports = defaultPortList;
+        ASSERT_TRUE(!ports.empty());
+
+        // default Ethernet0 has different lanes so create_ports() is triggered.
+        std::vector<FieldValueTuple> fvList = {
+            { "alias",        alias     },
+            { "index",        "0"       },
+            { "lanes",        "0,1,2,3" },
+            { "speed",        "100000"  },
+            { "fec",          "rs"      },
+            { "mtu",          "9100"    },
+            { "admin_status", "up"      }
+        };
+
+        portTable.set(alias, fvList);
+        portTable.set("PortConfigDone", { { "count", std::to_string(ports.size()) } });
+        gPortsOrch->addExistingData(&portTable);
+
+        const auto fec_count = _sai_set_port_fec_count;
+        const auto up_count = _sai_set_admin_state_up_count;
+        const auto down_count = _sai_set_admin_state_down_count;
+        _sai_port_fec_mode = SAI_PORT_FEC_MODE_NONE;
+        _sai_admin_state_up_count_at_fec_set = UINT32_MAX;
+
+        _hook_sai_port_api();
+        static_cast<Orch*>(gPortsOrch)->doTask();
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        _unhook_sai_port_api();
+
+        EXPECT_TRUE(taskList.empty());
+
+        Port p;
+        ASSERT_TRUE(gPortsOrch->getPort(alias, p));
+        EXPECT_TRUE(p.m_fec_cfg);
+        EXPECT_EQ(p.m_fec_mode, SAI_PORT_FEC_MODE_RS);
+
+        // Exactly one FEC set, with the configured mode ...
+        EXPECT_EQ(_sai_set_port_fec_count, fec_count + 1);
+        EXPECT_EQ(_sai_port_fec_mode, SAI_PORT_FEC_MODE_RS);
+        // ... applied before the port went admin up, and without an admin bounce.
+        EXPECT_EQ(_sai_admin_state_up_count_at_fec_set, up_count);
+        EXPECT_GT(_sai_set_admin_state_up_count, up_count);
+        EXPECT_EQ(_sai_set_admin_state_down_count, down_count);
+
+        // Re-applying the same configuration does not set FEC again.
+        portTable.set(alias, fvList);
+        gPortsOrch->addExistingData(&portTable);
+        _hook_sai_port_api();
+        static_cast<Orch*>(gPortsOrch)->doTask();
+        _unhook_sai_port_api();
+        EXPECT_EQ(_sai_set_port_fec_count, fec_count + 1);
+
         cleanupPorts(gPortsOrch);
     }
 
