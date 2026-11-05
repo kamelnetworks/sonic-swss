@@ -2833,6 +2833,178 @@ namespace aclorch_test
         ASSERT_FALSE(orch->getAclTable(l3TableName));
     }
 
+    // Built-in L2 table type (kamelnetworks sonic-buildimage #173): outer MAC,
+    // ether type and VLAN matches, member-port MAC filter rules, and no IP match.
+    TEST_F(AclOrchTest, L2Acl_Matches_Actions)
+    {
+        const string aclTableName = "PEERING-L2";
+
+        auto orch = createAclOrch();
+
+        ASSERT_TRUE(orch->getAclTableType(TABLE_TYPE_L2));
+
+        orch->doAclTableTask(
+            deque<KeyOpFieldsValuesTuple>(
+            {
+                {
+                    aclTableName,
+                    SET_COMMAND,
+                    {
+                        { ACL_TABLE_DESCRIPTION, "Peering member MAC filter" },
+                        { ACL_TABLE_TYPE, TABLE_TYPE_L2 },
+                        { ACL_TABLE_STAGE, STAGE_INGRESS },
+                        { ACL_TABLE_PORTS, "1,2" }
+                    }
+                }
+            })
+        );
+        auto table = orch->getAclTable(aclTableName);
+        ASSERT_TRUE(table);
+
+        auto fvs = vector<FieldValueTuple>{
+            { "SAI_ACL_TABLE_ATTR_ACL_BIND_POINT_TYPE_LIST", "2:SAI_ACL_BIND_POINT_TYPE_PORT,SAI_ACL_BIND_POINT_TYPE_LAG" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_SRC_MAC", "true" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_DST_MAC", "true" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_ETHER_TYPE", "true" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_OUTER_VLAN_ID", "true" },
+            { "SAI_ACL_TABLE_ATTR_ACL_STAGE", "SAI_ACL_STAGE_INGRESS" },
+        };
+        ASSERT_TRUE(validateAclTable(table->getOid(), *table,
+            make_shared<SaiAttributeList>(SAI_OBJECT_TYPE_ACL_TABLE, fvs, false)));
+
+        // Like L3, no action list unless the SAI says it is mandatory
+        ASSERT_TRUE(table->type.getActions().empty());
+
+        // No IP fields in the table
+        auto matches = table->type.getMatches();
+        ASSERT_EQ(matches.size(), 4u);
+        ASSERT_EQ(matches.count(SAI_ACL_TABLE_ATTR_FIELD_SRC_IP), 0u);
+        ASSERT_EQ(matches.count(SAI_ACL_TABLE_ATTR_FIELD_ACL_IP_TYPE), 0u);
+
+        auto setRule = [&](const string& rule, const vector<FieldValueTuple>& values)
+        {
+            vector<FieldValueTuple> fv = { { RULE_PRIORITY, "10" } };
+            fv.insert(fv.end(), values.begin(), values.end());
+            orch->doAclRuleTask(deque<KeyOpFieldsValuesTuple>({ { aclTableName + "|" + rule, SET_COMMAND, fv } }));
+        };
+
+        // Member MAC permitted, everything else dropped by an all-zero mask
+        setRule("PERMIT-MEMBER", { { MATCH_SRC_MAC, "52:54:00:d5:ca:e0" }, { ACTION_PACKET_ACTION, PACKET_ACTION_FORWARD } });
+        auto rule = orch->getAclRule(aclTableName, "PERMIT-MEMBER");
+        ASSERT_TRUE(rule);
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_SRC_MAC),
+                  "52:54:00:D5:CA:E0&mask:FF:FF:FF:FF:FF:FF");
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION), "SAI_PACKET_ACTION_FORWARD");
+        ASSERT_NE(rule->getCounterOid(), SAI_NULL_OBJECT_ID);
+
+        setRule("DROP-OTHER-MAC", { { MATCH_SRC_MAC, "00:00:00:00:00:00/00:00:00:00:00:00" },
+                                    { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+        rule = orch->getAclRule(aclTableName, "DROP-OTHER-MAC");
+        ASSERT_TRUE(rule);
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_SRC_MAC),
+                  "00:00:00:00:00:00&mask:00:00:00:00:00:00");
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION), "SAI_PACKET_ACTION_DROP");
+
+        // Destination MAC, ether type and VLAN in one rule
+        setRule("ARP-VLAN", { { MATCH_DST_MAC, "ff:ff:ff:ff:ff:ff" }, { MATCH_ETHER_TYPE, "0x0806" },
+                              { MATCH_VLAN_ID, "100" }, { ACTION_PACKET_ACTION, PACKET_ACTION_FORWARD } });
+        rule = orch->getAclRule(aclTableName, "ARP-VLAN");
+        ASSERT_TRUE(rule);
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_DST_MAC),
+                  "FF:FF:FF:FF:FF:FF&mask:FF:FF:FF:FF:FF:FF");
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_ETHER_TYPE), "2054&mask:0xffff");
+        ASSERT_EQ(getAclRuleSaiAttribute(*rule, SAI_ACL_ENTRY_ATTR_FIELD_OUTER_VLAN_ID), "100&mask:0xfff");
+
+        // IP matches are not part of the L2 type
+        setRule("SRC-IP", { { MATCH_SRC_IP, "10.0.0.1/32" }, { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+        ASSERT_FALSE(orch->getAclRule(aclTableName, "SRC-IP"));
+        setRule("IP-TYPE", { { MATCH_IP_TYPE, IP_TYPE_ANY }, { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } });
+        ASSERT_FALSE(orch->getAclRule(aclTableName, "IP-TYPE"));
+
+        for (const auto& name : { "PERMIT-MEMBER", "DROP-OTHER-MAC", "ARP-VLAN" })
+        {
+            orch->doAclRuleTask(deque<KeyOpFieldsValuesTuple>({ { aclTableName + "|" + name, DEL_COMMAND, {} } }));
+            ASSERT_FALSE(orch->getAclRule(aclTableName, name));
+        }
+
+        orch->doAclTableTask(deque<KeyOpFieldsValuesTuple>({ { aclTableName, DEL_COMMAND, {} } }));
+        ASSERT_FALSE(orch->getAclTable(aclTableName));
+    }
+
+    // A SAI that wants the action list at table creation, with packet action,
+    // redirect and counter actions available at both stages.
+    sai_status_t getSwitchAttributeL2(_In_ sai_object_id_t switch_id, _In_ uint32_t attr_count,
+                                      _Inout_ sai_attribute_t *attr_list)
+    {
+        if (attr_count == 1)
+        {
+            switch (attr_list[0].id)
+            {
+            case SAI_SWITCH_ATTR_MAX_ACL_ACTION_COUNT:
+                attr_list[0].value.u32 = 3;
+                return SAI_STATUS_SUCCESS;
+            case SAI_SWITCH_ATTR_ACL_STAGE_INGRESS:
+            case SAI_SWITCH_ATTR_ACL_STAGE_EGRESS:
+                attr_list[0].value.aclcapability.action_list.count = 3;
+                attr_list[0].value.aclcapability.action_list.list[0] = SAI_ACL_ACTION_TYPE_COUNTER;
+                attr_list[0].value.aclcapability.action_list.list[1] = SAI_ACL_ACTION_TYPE_PACKET_ACTION;
+                attr_list[0].value.aclcapability.action_list.list[2] = SAI_ACL_ACTION_TYPE_REDIRECT;
+                attr_list[0].value.aclcapability.is_action_list_mandatory = true;
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+        return old_sai_switch_api->get_switch_attribute(switch_id, attr_count, attr_list);
+    }
+
+    // When the action list is mandatory, the L2 table sends COUNTER with its
+    // default actions, so every rule can still carry a counter (Broadcom drops
+    // rules from a table created without it, see buildimage #169).
+    TEST_F(AclOrchTest, L2AclTableCreationWithMandatoryActions)
+    {
+        old_sai_switch_api = sai_switch_api;
+        sai_switch_api_t new_sai_switch_api = *sai_switch_api;
+        sai_switch_api = &new_sai_switch_api;
+        sai_switch_api->get_switch_attribute = getSwitchAttributeL2;
+
+        auto orch = createAclOrch();
+
+        for (const auto &stage : { STAGE_INGRESS, STAGE_EGRESS })
+        {
+            const string aclTableName = "l2_acl_table";
+            orch->doAclTableTask(deque<KeyOpFieldsValuesTuple>(
+                { { aclTableName, SET_COMMAND,
+                    { { ACL_TABLE_TYPE, TABLE_TYPE_L2 }, { ACL_TABLE_STAGE, stage }, { ACL_TABLE_PORTS, "1,2" } } } }));
+            auto table = orch->getAclTable(aclTableName);
+            ASSERT_NE(table, nullptr);
+
+            auto actions = table->type.getActions();
+            ASSERT_NE(actions.find(SAI_ACL_ACTION_TYPE_COUNTER), actions.end());
+            ASSERT_NE(actions.find(SAI_ACL_ACTION_TYPE_PACKET_ACTION), actions.end());
+            ASSERT_NE(actions.find(SAI_ACL_ACTION_TYPE_REDIRECT), actions.end());
+
+            auto fvs = vector<FieldValueTuple>{
+                { "SAI_ACL_TABLE_ATTR_ACL_ACTION_TYPE_LIST",
+                  "3:SAI_ACL_ACTION_TYPE_REDIRECT,SAI_ACL_ACTION_TYPE_PACKET_ACTION,SAI_ACL_ACTION_TYPE_COUNTER" },
+            };
+            ASSERT_TRUE(validateAclTable(table->getOid(), *table,
+                make_shared<SaiAttributeList>(SAI_OBJECT_TYPE_ACL_TABLE, fvs, false)));
+
+            orch->doAclRuleTask(deque<KeyOpFieldsValuesTuple>(
+                { { aclTableName + "|DROP-MAC", SET_COMMAND,
+                    { { RULE_PRIORITY, "10" }, { MATCH_SRC_MAC, "02:16:90:00:00:01" },
+                      { ACTION_PACKET_ACTION, PACKET_ACTION_DROP } } } }));
+            auto rule = orch->getAclRule(aclTableName, "DROP-MAC");
+            ASSERT_TRUE(rule);
+            ASSERT_NE(rule->getCounterOid(), SAI_NULL_OBJECT_ID);
+
+            orch->doAclRuleTask(deque<KeyOpFieldsValuesTuple>({ { aclTableName + "|DROP-MAC", DEL_COMMAND, {} } }));
+            orch->doAclTableTask(deque<KeyOpFieldsValuesTuple>({ { aclTableName, DEL_COMMAND, {} } }));
+            ASSERT_EQ(orch->getAclTable(aclTableName), nullptr);
+        }
+
+        sai_switch_api = old_sai_switch_api;
+    }
+
     TEST_F(AclOrchTest, AclInnerSourceMacRewriteTableValidation)
     {
         const string aclTableTypeName = "INNER_SRC_MAC_REWRITE_TABLE_TYPE";

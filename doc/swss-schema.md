@@ -648,7 +648,9 @@ Stores information about ACL tables on the switch.  Port names are defined in [p
                                             ; specific set of match and actions.
                                             ; There are pre-defined table types like
                                             ; "MIRROR", "MIRRORV6", "MIRROR_DSCP",
-                                            ; "L3", "L3V6", "MCLAG", "PFCWD", "DROP".
+                                            ; "L2", "L3", "L3V6", "MCLAG", "PFCWD", "DROP".
+                                            ; "L2" matches src_mac, dst_mac,
+                                            ; ether_type and vlan_id.
     ports         = [0-max_ports]*port_name ; the ports to which this ACL
                                             ; table is applied, can be emtry
                                             ; value annotations
@@ -711,11 +713,11 @@ Stores rules associated with a specific ACL table on the switch.
                                                ; outer source MAC, optionally with a
                                                ; bitmask ("aa:bb:cc:dd:ee:ff/ff:ff:ff:00:00:00").
                                                ; Exact match without a mask. The table's
-                                               ; type must list SRC_MAC in MATCHES.
+                                               ; type must be "L2" or list SRC_MAC in MATCHES.
 
     dst_mac       = mac_address ["/" mac_address]
                                                ; outer destination MAC, see src_mac.
-                                               ; The table's type must list DST_MAC.
+                                               ; The table's type must be "L2" or list DST_MAC.
 
     ip_type       = ip_types                   ; options of the l2_protocol_type
                                                ; field.

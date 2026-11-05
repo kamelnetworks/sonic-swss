@@ -23,6 +23,7 @@ extern "C" {
 #define STAGE_EGRESS       "EGRESS"
 #define STAGE_PRE_INGRESS  "PRE_INGRESS"
 
+#define TABLE_TYPE_L2                   "L2"
 #define TABLE_TYPE_L3                   "L3"
 #define TABLE_TYPE_L3V6                 "L3V6"
 #define TABLE_TYPE_L3V4V6               "L3V4V6"
