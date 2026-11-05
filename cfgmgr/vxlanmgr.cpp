@@ -82,6 +82,8 @@ static bool isValidMtu(const std::string &mtu)
 // Commands
 
 #define RET_SUCCESS 0
+// createVxlanNetdevice(): the device exists (warm reconcile) but its MTU could not be set
+#define RET_MTU_NOT_SET 2
 #define RET_FAILURE 1
 
 static int cmdCreateVxlan(const swss::VxlanMgr::VxlanInfo & info, std::string & res)
@@ -653,7 +655,12 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
 
     createAppDBTunnelMapTable(t);
     ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id, mtu);
-    if (ret != RET_SUCCESS)
+    if (ret == RET_MTU_NOT_SET)
+    {
+        SWSS_LOG_WARN("Failed to set MTU %s on reconciled VxlanNetDevice %s-%s, retrying",
+                      mtu.c_str(), vxlanTunnelName.c_str(), vlan_id.c_str());
+    }
+    else if (ret != RET_SUCCESS)
     {
         SWSS_LOG_WARN("Vxlan Net Dev creation failure for %s VNI(%s) VLAN(%s)",
                        vxlanTunnelName.c_str(), vni_id.c_str(), vlan_id.c_str());
@@ -666,12 +673,18 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
     map_entry.vxlan_dev_name = vxlan_dev_name;
     map_entry.vlan = vlan;
     map_entry.vni_id = vni_id;
-    map_entry.mtu = mtu;
+    // An empty mtu means "not applied": doVlanSetTask() then sets it on the retry below
+    map_entry.mtu = (ret == RET_MTU_NOT_SET) ? "" : mtu;
 
     m_vxlanTunnelMapCache[vxlanTunnelMapName] = map_entry;
     m_vlanMapCache[vlan] = vni_id;
     m_vniMapCache[vni_id] = vlan;
     m_vxlanTunnelCache[vxlanTunnelName].vlan_vni_refcnt++;
+
+    if (ret == RET_MTU_NOT_SET)
+    {
+        retryVlanMtu(vlan);
+    }
 
     //Inform the Vlan Mgr to update the tunnel flags if Arp/Nd Suppression is set.
     std::string key = "Vlan" + std::string(vlan_id);
@@ -1057,7 +1070,11 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
                             vxlan_dev_name.c_str(), m_vxlanNetDevices.size());
             // The device survived a warm restart; make sure it carries the VLAN MTU
             // (it may have been created by an image that left it at the kernel default).
-            return setVxlanNetdeviceMtu(vxlan_dev_name, mtu);
+            if (setVxlanNetdeviceMtu(vxlan_dev_name, mtu) != RET_SUCCESS)
+            {
+                return RET_MTU_NOT_SET;
+            }
+            return RET_SUCCESS;
         }
         else
         {
@@ -1218,6 +1235,7 @@ bool VxlanMgr::doVlanSetTask(const KeyOpFieldsValuesTuple & t)
         }
     }
 
+    bool applied = true;
     for (auto & map : m_vxlanTunnelMapCache)
     {
         MapCache & map_entry = map.second;
@@ -1229,12 +1247,29 @@ bool VxlanMgr::doVlanSetTask(const KeyOpFieldsValuesTuple & t)
                         mtu.c_str(), map_entry.vxlan_dev_name.c_str(), vlan.c_str());
         if (setVxlanNetdeviceMtu(map_entry.vxlan_dev_name, mtu) != RET_SUCCESS)
         {
-            SWSS_LOG_WARN("Failed to set MTU %s on VxlanNetDevice %s",
+            // Keep the task so it is retried; the cache still holds the MTU the kernel has
+            SWSS_LOG_WARN("Failed to set MTU %s on VxlanNetDevice %s, retrying",
                           mtu.c_str(), map_entry.vxlan_dev_name.c_str());
+            applied = false;
+            continue;
         }
         map_entry.mtu = mtu;
     }
-    return true;
+    return applied;
+}
+
+/* Queue the VLAN's current CONFIG_DB entry so doVlanSetTask() (re)applies its MTU */
+void VxlanMgr::retryVlanMtu(const std::string & vlan)
+{
+    auto consumer = dynamic_cast<Consumer *>(getExecutor(CFG_VLAN_TABLE_NAME));
+    if (consumer == nullptr)
+    {
+        SWSS_LOG_WARN("No %s consumer, cannot retry the MTU of %s", CFG_VLAN_TABLE_NAME, vlan.c_str());
+        return;
+    }
+    std::vector<FieldValueTuple> fvs;
+    m_cfgVlanTable.get(vlan, fvs);
+    consumer->addToSync(KeyOpFieldsValuesTuple(vlan, SET_COMMAND, fvs));
 }
 
 std::vector<std::string> VxlanMgr::parseNetDev(const string& stdout){

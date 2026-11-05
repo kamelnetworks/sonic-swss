@@ -68,6 +68,7 @@ private:
     bool doVxlanEvpnNvoDeleteTask(const KeyOpFieldsValuesTuple & t);
 
     bool doVlanSetTask(const KeyOpFieldsValuesTuple & t);
+    void retryVlanMtu(const std::string & vlan);
 
     void createAppDBTunnelMapTable(const KeyOpFieldsValuesTuple & t);
     void delAppDBTunnelMapTable(std::string vxlanTunnelMapName);
