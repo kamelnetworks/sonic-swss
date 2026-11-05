@@ -1149,13 +1149,32 @@ uint32_t SflowOrch::sflowSessionGetRate(sai_object_id_t m_sample_id)
     return 0;
 }
 
+/* Drop a port's bookkeeping and release its session's reference. The port's
+ * samplepacket attribute is not touched; the caller has already unbound it,
+ * or the port no longer exists. */
+bool SflowOrch::releaseSflowPortInfo(SflowPortInfoMap::iterator port_info)
+{
+    uint32_t rate = sflowSessionGetRate(port_info->second.m_sample_id);
+
+    m_sflowPortInfoMap.erase(port_info);
+    m_sflowRateSampleMap[rate].ref_count--;
+    if (m_sflowRateSampleMap[rate].ref_count == 0)
+    {
+        if (!sflowDestroySession(m_sflowRateSampleMap[rate]))
+        {
+            return false;
+        }
+        m_sflowRateSampleMap.erase(rate);
+    }
+    return true;
+}
+
 bool SflowOrch::handleSflowSessionDel(sai_object_id_t port_id)
 {
     auto sflowInfo = m_sflowPortInfoMap.find(port_id);
 
     if (sflowInfo != m_sflowPortInfoMap.end())
     {
-        uint32_t rate = sflowSessionGetRate(sflowInfo->second.m_sample_id);
         if (sflowInfo->second.admin_state)
         {
             if (!sflowDelPort(port_id, sflowInfo->second.m_sample_dir))
@@ -1165,15 +1184,22 @@ bool SflowOrch::handleSflowSessionDel(sai_object_id_t port_id)
             sflowInfo->second.admin_state = false;
         }
 
-        m_sflowPortInfoMap.erase(port_id);
-        m_sflowRateSampleMap[rate].ref_count--;
-        if (m_sflowRateSampleMap[rate].ref_count == 0)
+        return releaseSflowPortInfo(sflowInfo);
+    }
+    return true;
+}
+
+/* Session DEL for a port PortsOrch has already removed (dynamic port breakout
+ * deletes the port before sflowmgrd's DEL reaches us). The SAI port is gone,
+ * so only the bookkeeping is released. */
+bool SflowOrch::handleSflowSessionDelByAlias(const string &alias)
+{
+    for (auto it = m_sflowPortInfoMap.begin(); it != m_sflowPortInfoMap.end(); it++)
+    {
+        if (it->second.m_alias == alias)
         {
-            if (!sflowDestroySession(m_sflowRateSampleMap[rate]))
-            {
-                return false;
-            }
-            m_sflowRateSampleMap.erase(rate);
+            SWSS_LOG_NOTICE("Port %s no longer exists, releasing its sFlow session", alias.c_str());
+            return releaseSflowPortInfo(it);
         }
     }
     return true;
@@ -1202,7 +1228,36 @@ void SflowOrch::doTask(Consumer &consumer)
         string op = kfvOp(tuple);
         string alias = kfvKey(tuple);
 
-        gPortsOrch->getPort(alias, port);
+        if (!gPortsOrch->getPort(alias, port) || port.m_port_id == SAI_NULL_OBJECT_ID)
+        {
+            if (op == SET_COMMAND)
+            {
+                /* The port is not created yet. Dynamic port breakout re-adds the
+                 * port after sflowmgrd has published its session, so wait for
+                 * PortsOrch instead of binding the session to a null port oid. */
+                if (m_sflowPendingPorts.insert(alias).second)
+                {
+                    SWSS_LOG_NOTICE("Port %s does not exist yet, sFlow session is deferred", alias.c_str());
+                }
+                it++;
+                continue;
+            }
+
+            m_sflowPendingPorts.erase(alias);
+            if (!handleSflowSessionDelByAlias(alias))
+            {
+                it++;
+                continue;
+            }
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        if (m_sflowPendingPorts.erase(alias))
+        {
+            SWSS_LOG_NOTICE("Port %s exists now, applying its deferred sFlow session", alias.c_str());
+        }
+
         if (op == SET_COMMAND)
         {
             bool      admin_state = m_sflowStatus;
@@ -1254,6 +1309,7 @@ void SflowOrch::doTask(Consumer &consumer)
                     m_sflowRateSampleMap[rate] = session;
                     port_info.m_sample_id = session.m_sample_id;
                 }
+                port_info.m_alias = alias;
                 port_info.m_sample_dir = dir;
 
                 if (admin_state)
