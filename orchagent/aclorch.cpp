@@ -203,6 +203,26 @@ static const acl_capabilities_t defaultAclActionsSupported =
 static acl_table_action_list_lookup_t defaultAclActionList =
 {
     {
+        // L2
+        TABLE_TYPE_L2,
+        {
+            {
+                ACL_STAGE_INGRESS,
+                {
+                    SAI_ACL_ACTION_TYPE_PACKET_ACTION,
+                    SAI_ACL_ACTION_TYPE_REDIRECT
+                }
+            },
+            {
+                ACL_STAGE_EGRESS,
+                {
+                    SAI_ACL_ACTION_TYPE_PACKET_ACTION,
+                    SAI_ACL_ACTION_TYPE_REDIRECT
+                }
+            }
+        }
+    },
+    {
         // L3
         TABLE_TYPE_L3,
         {
@@ -4046,6 +4066,22 @@ void AclOrch::initDefaultTableTypes(const string& platform, const string& sub_pl
     SWSS_LOG_ENTER();
 
     AclTableTypeBuilder builder;
+
+    // Outer L2 header only, e.g. source MAC filters on member ports. Like the
+    // other built-in types it has no ACTIONS, so no action list goes to SAI
+    // unless the SAI requires one; addMandatoryActions() then sends COUNTER
+    // plus the defaultAclActionList entry. Broadcom refuses counters on rules
+    // in a table created with an action list that lacks COUNTER.
+    addAclTableType(
+        builder.withName(TABLE_TYPE_L2)
+            .withBindPointType(SAI_ACL_BIND_POINT_TYPE_PORT)
+            .withBindPointType(SAI_ACL_BIND_POINT_TYPE_LAG)
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_SRC_MAC))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_DST_MAC))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_ETHER_TYPE))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_OUTER_VLAN_ID))
+            .build()
+    );
 
     addAclTableType(
         builder.withName(TABLE_TYPE_L3)
