@@ -33,6 +33,7 @@ TeamMgr::TeamMgr(DBConnector *confDb, DBConnector *applDb, DBConnector *statDb,
     m_cfgPortTable(confDb, CFG_PORT_TABLE_NAME),
     m_cfgLagTable(confDb, CFG_LAG_TABLE_NAME),
     m_cfgLagMemberTable(confDb, CFG_LAG_MEMBER_TABLE_NAME),
+    m_cfgVlanMemberTable(confDb, CFG_VLAN_MEMBER_TABLE_NAME),
     m_appPortTable(applDb, APP_PORT_TABLE_NAME),
     m_appLagTable(applDb, APP_LAG_TABLE_NAME),
     m_statePortTable(statDb, STATE_PORT_TABLE_NAME),
@@ -389,7 +390,16 @@ void TeamMgr::doLagMemberTask(Consumer &consumer)
         }
         else if (op == DEL_COMMAND)
         {
-            removeLagMember(lag, member);
+            if (m_deferredLagMembers.erase(member))
+            {
+                /* Never enslaved: nothing to undo in the kernel */
+                SWSS_LOG_NOTICE("Deferred member %s of port channel %s was removed from the config",
+                                member.c_str(), lag.c_str());
+            }
+            else
+            {
+                removeLagMember(lag, member);
+            }
         }
 
         it = consumer.m_toSync.erase(it);
@@ -420,16 +430,6 @@ bool TeamMgr::checkPortIffUp(const string &port)
     return ifr.ifr_flags & IFF_UP;
 }
 
-bool TeamMgr::isPortEnslaved(const string &port)
-{
-    SWSS_LOG_ENTER();
-
-    struct stat buf;
-    string path = "/sys/class/net/" + port + "/master";
-
-    return lstat(path.c_str(), &buf) == 0;
-}
-
 bool TeamMgr::findPortMaster(string &master, const string &port)
 {
     SWSS_LOG_ENTER();
@@ -446,6 +446,26 @@ bool TeamMgr::findPortMaster(string &master, const string &port)
         if (port == member)
         {
             master = lag;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Is the port configured as a member of any VLAN (CONFIG_DB VLAN_MEMBER)?
+bool TeamMgr::isConfiguredVlanMember(const string &port)
+{
+    SWSS_LOG_ENTER();
+
+    vector<string> keys;
+    m_cfgVlanMemberTable.getKeys(keys);
+
+    for (auto key: keys)
+    {
+        auto tokens = tokenize(key, config_db_key_delimiter);
+        if (tokens.size() == 2 && tokens[1] == port)
+        {
             return true;
         }
     }
@@ -866,17 +886,42 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
     string res;
 
     // If port was already deleted, ignore this operation
-    cmd << IP_CMD << " link show " << shellquote(member);
-    if (exec(cmd.str(), res) != 0)
+    string master;
+    if (!getNetdevMaster(member, master))
     {
-	SWSS_LOG_WARN("Unable to find port %s", member.c_str());
-	return task_ignore;
+        SWSS_LOG_WARN("Unable to find port %s", member.c_str());
+        return task_ignore;
     }
 
-    // If port is already enslaved, ignore this operation
-    // TODO: check the current master if it is the same as to be configured
-    if (isPortEnslaved(member))
+    // If port is already enslaved by this port channel, ignore this operation
+    if (master == lag)
     {
+        return task_ignore;
+    }
+
+    // The port is a VLAN member: it is configured in VLAN_MEMBER, or its
+    // kernel master is the Dot1Q bridge. Enslaving it now would silently
+    // pull it out of the bridge behind vlanmgrd's back and leave the kernel
+    // and the ASIC disagreeing (the CLI rejects this combination). Defer
+    // until the VLAN membership is removed; the retry happens on every
+    // select timeout. The config check makes the outcome deterministic when
+    // both memberships are written at once, the kernel check covers a
+    // membership vlanmgrd applied before the config was visible here.
+    bool configured = isConfiguredVlanMember(member);
+    if (configured || master == DOT1Q_BRIDGE_NAME)
+    {
+        if (m_deferredLagMembers.insert(member).second)
+        {
+            SWSS_LOG_WARN("Port %s is a VLAN member (%s), deferring adding it to port channel %s until it is removed from the VLAN(s)",
+                          member.c_str(), configured ? "configured in VLAN_MEMBER" : "kernel master " DOT1Q_BRIDGE_NAME, lag.c_str());
+        }
+        return task_need_retry;
+    }
+
+    if (!master.empty())
+    {
+        SWSS_LOG_WARN("Port %s is already enslaved by %s, ignoring adding it to port channel %s",
+                      member.c_str(), master.c_str(), lag.c_str());
         return task_ignore;
     }
 
@@ -954,6 +999,11 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
     fvs.push_back(fv);
     m_appPortTable.set(member, fvs);
 
+    if (m_deferredLagMembers.erase(member))
+    {
+        SWSS_LOG_NOTICE("Port %s is no longer a VLAN member, adding the deferred member to port channel %s",
+                        member.c_str(), lag.c_str());
+    }
     SWSS_LOG_NOTICE("Add %s to port channel %s", member.c_str(), lag.c_str());
 
     return task_success;

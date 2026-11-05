@@ -1,6 +1,10 @@
 #include "gtest/gtest.h"
 #include "../mock_table.h"
+#define private public
+#define protected public
 #include "teammgr.h"
+#undef protected
+#undef private
 #include <dlfcn.h>
 #include <net/if.h>
 #include <netlink/addr.h>
@@ -525,5 +529,157 @@ namespace teammgr_ut
         EXPECT_TRUE(std::any_of(values.begin(), values.end(), [](const auto &fv) {
             return fvField(fv) == "system_mac" && fvValue(fv) == "02:03:04:05:06:07";
         }));
+    }
+    /* Kernel master reported by "ip -o link show dev <port>" in the tests below */
+    static std::string mock_port_master;
+
+    static int cb_lag_member(const std::string &cmd, std::string &stdout)
+    {
+        if (cmd.find("/sbin/ip -o link show dev") != std::string::npos)
+        {
+            mockCallArgs.push_back(cmd);
+            stdout = "47: Ethernet0: <BROADCAST,MULTICAST> mtu 9100 qdisc noop ";
+            if (!mock_port_master.empty())
+            {
+                stdout += "master " + mock_port_master + " ";
+            }
+            stdout += "state DOWN mode DEFAULT group default qlen 1000\\    link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff\n";
+            return 0;
+        }
+        return cb(cmd, stdout);
+    }
+
+    static bool commandSeen(const std::string &needle)
+    {
+        for (const auto &c : mockCallArgs)
+        {
+            if (c.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void addReadyLagAndPort(swss::DBConnector *state_db)
+    {
+        swss::Table state_lag_table(state_db, STATE_LAG_TABLE_NAME);
+        state_lag_table.set("PortChannel99", { { "state", "ok" } });
+        swss::Table state_port_table(state_db, STATE_PORT_TABLE_NAME);
+        state_port_table.set("Ethernet0", { { "state", "ok" } });
+    }
+
+    /* A port that is still a VLAN member (kernel master Bridge) is not enslaved
+     * until it leaves the bridge; the LAG member is retried, not dropped. */
+    TEST_F(TeamMgrTest, testLagMemberDeferredWhilePortIsVlanMember)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "Bridge";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 1);   /* kept for retry */
+        swss::Table app_port_table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        std::vector<swss::FieldValueTuple> fvs;
+        EXPECT_FALSE(app_port_table.get("Ethernet0", fvs));
+
+        /* Still a VLAN member on the next retry: still deferred */
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+
+        /* vlanmgrd detached the port from the bridge: the retry enslaves it */
+        mock_port_master = "";
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port add \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(app_port_table.get("Ethernet0", fvs));
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* The same deferral when the VLAN membership is only configured (CONFIG_DB
+     * VLAN_MEMBER) and vlanmgrd has not applied it to the kernel yet */
+    TEST_F(TeamMgrTest, testLagMemberDeferredWhileVlanMemberConfigured)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        swss::Table cfg_vlan_member_table(m_config_db.get(), CFG_VLAN_MEMBER_TABLE_NAME);
+        cfg_vlan_member_table.set("Vlan3999|Ethernet0", { { "tagging_mode", "untagged" } });
+        /* A VLAN member that is another port, or a port channel, doesn't count */
+        cfg_vlan_member_table.set("Vlan3999|Ethernet4", { { "tagging_mode", "untagged" } });
+        cfg_vlan_member_table.set("Vlan3999|PortChannel99", { { "tagging_mode", "tagged" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        /* The VLAN membership is removed from the config: the retry enslaves the port */
+        cfg_vlan_member_table.del("Vlan3999|Ethernet0");
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port add \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* Removing a deferred member from the config forgets it without touching teamd */
+    TEST_F(TeamMgrTest, testDeferredLagMemberRemovedFromConfig)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "Bridge";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port remove"));
+        EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* A port already enslaved by its port channel is left alone */
+    TEST_F(TeamMgrTest, testLagMemberAlreadyEnslavedIsIgnored)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "PortChannel99";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
     }
 }

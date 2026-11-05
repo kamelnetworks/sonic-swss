@@ -395,6 +395,8 @@ private:
     map<string, Port> m_portList;
     map<string, Port> m_pluggedModulesPort;
     map<string, vlan_members_t> m_portVlanMember;
+    /* LAG members whose add is deferred because the port is still a VLAN member */
+    set<string> m_deferredLagMembers;
     map<string, std::vector<sai_object_id_t>> m_port_voq_ids;
     /* mapping from SAI object ID to Name for faster
      * retrieval of Port/VLAN from object ID for events
