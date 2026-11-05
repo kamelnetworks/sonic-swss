@@ -1384,7 +1384,13 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
 
             p.m_fec_mode = cit.fec.value;
             p.m_override_fec = cit.fec.override_fec;
-            p.m_fec_cfg = true;
+            // Leave m_fec_cfg unset so that doPortTask() also applies the FEC
+            // mode with set_port_attribute() right after the create, while the
+            // new port is still admin down. Broadcom's SAI (TD3, libsaibcm
+            // 15.2.1) accepts SAI_PORT_ATTR_FEC_MODE on create_port() but does
+            // not program it on a dynamically created (DPB) port: a 1x100G port
+            // re-created by breakout came up with CL91 off and stayed in local
+            // fault against an RS-FEC peer until swss restarted.
         }
 
         if (cit.tpid.is_set)
