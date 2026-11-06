@@ -20,6 +20,7 @@ namespace vxlanmgr_ut
 
     static const string TUNNEL = "vtep";
     static const string SRC_IP = "10.0.0.1";
+    static const string SRC_IP6 = "fc00::1";
 
     /*
      * Shell mock for the failure and warm-restart cases: records every command like the
@@ -45,6 +46,22 @@ namespace vxlanmgr_ut
         }
         return 0;
     }
+
+    /* Same table list as vxlanmgrd.cpp */
+    static const vector<string> VXLANMGRD_TABLES = {
+        CFG_VNET_TABLE_NAME,
+        CFG_VXLAN_TUNNEL_TABLE_NAME,
+        CFG_VXLAN_TUNNEL_MAP_TABLE_NAME,
+        CFG_VXLAN_EVPN_NVO_TABLE_NAME,
+        CFG_PORT_TABLE_NAME,
+        CFG_LAG_TABLE_NAME,
+        CFG_INTF_TABLE_NAME,
+        CFG_LAG_INTF_TABLE_NAME,
+        CFG_VLAN_SUB_INTF_TABLE_NAME,
+    };
+
+    static const string NETDEV_LINK_1500 =
+        "86: vtep-100: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master Bridge state UNKNOWN mode DEFAULT group default qlen 1000\n";
 
     struct VxlanMgrTest : public ::testing::Test
     {
@@ -74,15 +91,7 @@ namespace vxlanmgr_ut
             g_failMtuSets = 0;
             g_vxlanLinks = "";
 
-            /* Same table list as vxlanmgrd.cpp */
-            vector<string> tables = {
-                CFG_VNET_TABLE_NAME,
-                CFG_VXLAN_TUNNEL_TABLE_NAME,
-                CFG_VXLAN_TUNNEL_MAP_TABLE_NAME,
-                CFG_VXLAN_EVPN_NVO_TABLE_NAME,
-                CFG_VLAN_TABLE_NAME,
-            };
-            m_vxlanMgr = make_shared<VxlanMgr>(m_config_db.get(), m_app_db.get(), m_state_db.get(), tables);
+            m_vxlanMgr = make_shared<VxlanMgr>(m_config_db.get(), m_app_db.get(), m_state_db.get(), VXLANMGRD_TABLES);
 
             /* vxlanmgrd main(): reconcile window opens at start and closes on the first select timeout */
             m_vxlanMgr->beginReconcile(false);
@@ -107,40 +116,55 @@ namespace vxlanmgr_ut
             /* Otherwise the constructor deletes the netdevs as stale */
             WarmStart::initialize("vxlanmgrd", "swss");
             WarmStart::getInstance().m_enabled = true;
-            vector<string> tables = {
-                CFG_VNET_TABLE_NAME,
-                CFG_VXLAN_TUNNEL_TABLE_NAME,
-                CFG_VXLAN_TUNNEL_MAP_TABLE_NAME,
-                CFG_VXLAN_EVPN_NVO_TABLE_NAME,
-                CFG_VLAN_TABLE_NAME,
-            };
-            m_vxlanMgr = make_shared<VxlanMgr>(m_config_db.get(), m_app_db.get(), m_state_db.get(), tables);
+            m_vxlanMgr = make_shared<VxlanMgr>(m_config_db.get(), m_app_db.get(), m_state_db.get(), VXLANMGRD_TABLES);
             m_vxlanMgr->beginReconcile(true);
             mockCallArgs.clear();
         }
 
-        /*
-         * Configure VLAN <vlan> (with the given CONFIG_DB fields, state ok), the source VTEP
-         * and a <vlan> <-> <vni> tunnel map, then let vxlanmgrd process it.
-         */
-        void createMapping(const string &vlan, const string &vni, const vector<FieldValueTuple> &vlanFvs)
+        /* Set a CONFIG_DB entry in <table> and let vxlanmgrd process the notification. */
+        void setConfig(const string &table, const string &key, const vector<FieldValueTuple> &fvs)
         {
-            m_cfgVlanTable->set(vlan, vlanFvs);
-            m_stateVlanTable->set(vlan, { {"state", "ok"} });
-            m_cfgTunnelTable->set(TUNNEL, { {"src_ip", SRC_IP} });
-            m_cfgTunnelMapTable->set(TUNNEL + "|map_" + vni + "_" + vlan, { {"vlan", vlan}, {"vni", vni} });
-
-            m_vxlanMgr->addExistingData(m_cfgVlanTable.get());
-            m_vxlanMgr->addExistingData(m_cfgTunnelTable.get());
-            m_vxlanMgr->addExistingData(m_cfgTunnelMapTable.get());
+            Table t(m_config_db.get(), table);
+            t.set(key, fvs);
+            auto consumer = dynamic_cast<Consumer *>(m_vxlanMgr->getExecutor(table));
+            ASSERT_NE(nullptr, consumer) << "vxlanmgrd does not subscribe to " << table;
+            consumer->addToSync({ key, SET_COMMAND, fvs });
             m_vxlanMgr->doTask();
         }
 
-        /* Change the VLAN's CONFIG_DB fields and let vxlanmgrd process it. */
-        void updateVlan(const string &vlan, const vector<FieldValueTuple> &vlanFvs)
+        /* Delete a CONFIG_DB entry in <table> and let vxlanmgrd process the notification. */
+        void delConfig(const string &table, const string &key)
+        {
+            Table t(m_config_db.get(), table);
+            t.del(key);
+            auto consumer = dynamic_cast<Consumer *>(m_vxlanMgr->getExecutor(table));
+            ASSERT_NE(nullptr, consumer) << "vxlanmgrd does not subscribe to " << table;
+            consumer->addToSync({ key, DEL_COMMAND, {} });
+            m_vxlanMgr->doTask();
+        }
+
+        /* The lab underlay: eBGP over PortChannel2 (mtu <mtu>) with an address in the default VRF */
+        void setPortChannelUnderlay(const string &mtu)
+        {
+            setConfig(CFG_LAG_TABLE_NAME, "PortChannel2", { {"admin_status", "up"}, {"mtu", mtu} });
+            setConfig(CFG_LAG_INTF_TABLE_NAME, "PortChannel2", {});
+            setConfig(CFG_LAG_INTF_TABLE_NAME, "PortChannel2|10.1.0.0/31", {});
+        }
+
+        /*
+         * Configure VLAN <vlan> (with the given CONFIG_DB fields, state ok), the source VTEP
+         * <srcIp> and a <vlan> <-> <vni> tunnel map, then let vxlanmgrd process it.
+         */
+        void createMapping(const string &vlan, const string &vni, const vector<FieldValueTuple> &vlanFvs,
+                           const string &srcIp = SRC_IP)
         {
             m_cfgVlanTable->set(vlan, vlanFvs);
-            m_vxlanMgr->addExistingData(m_cfgVlanTable.get());
+            m_stateVlanTable->set(vlan, { {"state", "ok"} });
+            m_cfgTunnelTable->set(TUNNEL, { {"src_ip", srcIp} });
+            m_cfgTunnelMapTable->set(TUNNEL + "|map_" + vni + "_" + vlan, { {"vlan", vlan}, {"vni", vni} });
+
+            m_vxlanMgr->addExistingData(m_cfgTunnelTable.get());
+            m_vxlanMgr->addExistingData(m_cfgTunnelMapTable.get());
             m_vxlanMgr->doTask();
         }
 
@@ -156,6 +180,20 @@ namespace vxlanmgr_ut
                 }
             }
             return "";
+        }
+
+        /* The MTU vtep-100 was created with, or "" if it was not created */
+        static string createdMtu(const string &dev = "vtep-100")
+        {
+            const string cmd = linkAddCmd(dev);
+            const string needle = " mtu ";
+            size_t pos = cmd.find(needle);
+            if (pos == string::npos)
+            {
+                return "";
+            }
+            pos += needle.size();
+            return cmd.substr(pos, cmd.find(' ', pos) - pos);
         }
 
         /* The MTU vxlanmgrd has recorded as applied to the netdev mapped to <vlan> */
@@ -183,114 +221,196 @@ namespace vxlanmgr_ut
             }
             return n;
         }
+
+        static string setMtuCmd(const string &mtu)
+        {
+            return string(IP_CMD) + " link set dev vtep-100 mtu " + mtu;
+        }
     };
 
-    /* kamelnetworks/sonic-buildimage#74: the VXLAN netdev must carry the VLAN's MTU, not the kernel default 1500. */
-    TEST_F(VxlanMgrTest, NetdevCreatedWithVlanMtu)
+    /*
+     * kamelnetworks/sonic-buildimage#74: the VXLAN netdev must not keep the kernel default 1500.
+     * It gets the underlay MTU minus the 50 bytes of IPv4 VXLAN encapsulation: 9100 - 50 = 9050.
+     */
+    TEST_F(VxlanMgrTest, NetdevCreatedWithUnderlayMtuMinusVxlanOverhead)
     {
-        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "9000"} });
+        setPortChannelUnderlay("9100");
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
 
         string cmd = linkAddCmd("vtep-100");
         ASSERT_NE("", cmd) << "vtep-100 was not created";
-        EXPECT_NE(string::npos, cmd.find(" mtu 9000 type vxlan ")) << cmd;
+        EXPECT_NE(string::npos, cmd.find(" mtu 9050 type vxlan ")) << cmd;
+        EXPECT_EQ("9050", cachedMtu("Vlan100"));
         /* Unrelated parts of the command are unchanged */
         EXPECT_NE(string::npos, cmd.find(" address 00:11:22:33:44:55 ")) << cmd;
         EXPECT_NE(string::npos, cmd.find(" type vxlan id 100 local " + SRC_IP + " nolearning ")) << cmd;
         EXPECT_NE(string::npos, cmd.find(" dstport 4789")) << cmd;
     }
 
-    /* A VLAN without an explicit mtu gets the SONiC default (9100), like vlanmgrd gives the Bridge. */
-    TEST_F(VxlanMgrTest, NetdevCreatedWithDefaultMtuWhenVlanHasNone)
+    /* An IPv6 source VTEP adds a 40-byte outer header instead of 20: 9100 - 70 = 9030. */
+    TEST_F(VxlanMgrTest, Ipv6SourceVtepUses70ByteOverhead)
     {
-        createMapping("Vlan200", "200", { {"vlanid", "200"} });
+        setPortChannelUnderlay("9100");
+        createMapping("Vlan100", "100", { {"vlanid", "100"} }, SRC_IP6);
 
-        string cmd = linkAddCmd("vtep-200");
-        ASSERT_NE("", cmd) << "vtep-200 was not created";
-        EXPECT_NE(string::npos, cmd.find(" mtu 9100 type vxlan ")) << cmd;
+        ASSERT_NE("", linkAddCmd("vtep-100")) << "vtep-100 was not created";
+        EXPECT_EQ("9030", createdMtu()) << linkAddCmd("vtep-100");
     }
 
-    /* An mtu that is not a number is not interpolated into the shell command; the default is used. */
-    TEST_F(VxlanMgrTest, NetdevCreatedWithDefaultMtuWhenVlanMtuIsInvalid)
+    /*
+     * Without any default-VRF router interface the underlay is assumed to have the SONiC default
+     * MTU 9100. Ports without an address (L2, or not in use) don't count, whatever their MTU.
+     */
+    TEST_F(VxlanMgrTest, DefaultUnderlayMtuWithoutRouterInterfaces)
     {
-        createMapping("Vlan300", "300", { {"vlanid", "300"}, {"mtu", "9000; touch /tmp/x"} });
+        setConfig(CFG_PORT_TABLE_NAME, "Ethernet0", { {"mtu", "1500"} });
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
 
-        string cmd = linkAddCmd("vtep-300");
-        ASSERT_NE("", cmd) << "vtep-300 was not created";
-        EXPECT_NE(string::npos, cmd.find(" mtu 9100 type vxlan ")) << cmd;
-        EXPECT_EQ(string::npos, cmd.find("touch")) << cmd;
+        EXPECT_EQ("9050", createdMtu()) << linkAddCmd("vtep-100");
     }
 
-    /* Changing the VLAN MTU is applied to the mapped netdev; VLANs without a map are ignored. */
-    TEST_F(VxlanMgrTest, VlanMtuChangeUpdatesNetdev)
+    /*
+     * The underlay MTU is the minimum over the default-VRF router ports and PortChannels. VLAN
+     * SVIs (overlay), loopbacks (no egress) and interfaces in another VRF are not part of it.
+     */
+    TEST_F(VxlanMgrTest, UnderlayMtuIsMinimumOfDefaultVrfRouterInterfaces)
     {
-        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "9000"} });
-        ASSERT_NE("", linkAddCmd("vtep-100"));
+        setPortChannelUnderlay("9100");
+        setConfig(CFG_PORT_TABLE_NAME, "Ethernet0", { {"mtu", "9000"} });
+        setConfig(CFG_INTF_TABLE_NAME, "Ethernet0|10.2.0.0/31", {});
+        /* A small MTU on a port in another VRF */
+        setConfig(CFG_PORT_TABLE_NAME, "Ethernet4", { {"mtu", "1500"} });
+        setConfig(CFG_INTF_TABLE_NAME, "Ethernet4", { {"vrf_name", "Vrf-red"} });
+        setConfig(CFG_INTF_TABLE_NAME, "Ethernet4|192.168.0.1/24", {});
+        /* A tenant SVI with a small MTU, and the VTEP loopback */
+        Table(m_config_db.get(), CFG_VLAN_INTF_TABLE_NAME).set("Vlan100|10.100.0.1/24", {});
+        Table(m_config_db.get(), CFG_LOOPBACK_INTERFACE_TABLE_NAME).set("Loopback0|10.0.0.1/32", {});
+        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "1500"} });
+
+        EXPECT_EQ("8950", createdMtu()) << linkAddCmd("vtep-100");
+    }
+
+    /* A sub-interface counts with its own MTU, capped by its parent's like intfmgrd does. */
+    TEST_F(VxlanMgrTest, SubInterfaceUnderlayIsCappedByParent)
+    {
+        setConfig(CFG_PORT_TABLE_NAME, "Ethernet8", { {"mtu", "9000"} });
+        setConfig(CFG_VLAN_SUB_INTF_TABLE_NAME, "Eth8.10", { {"vlan", "10"} });
+        setConfig(CFG_VLAN_SUB_INTF_TABLE_NAME, "Eth8.10|10.3.0.0/31", {});
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
+        EXPECT_EQ("8950", createdMtu()) << linkAddCmd("vtep-100");
+
+        /* Its own, smaller MTU */
         mockCallArgs.clear();
+        setConfig(CFG_VLAN_SUB_INTF_TABLE_NAME, "Eth8.10", { {"vlan", "10"}, {"mtu", "4000"} });
+        EXPECT_EQ(1u, countCmds(setMtuCmd("3950"))) << ::testing::PrintToString(mockCallArgs);
+    }
 
-        updateVlan("Vlan100", { {"vlanid", "100"}, {"mtu", "1600"} });
-        EXPECT_EQ(1u, countCmds(string(IP_CMD) + " link set dev vtep-100 mtu 1600"))
-            << "commands: " << ::testing::PrintToString(mockCallArgs);
+    /*
+     * An underlay MTU change is followed: lowering the PortChannel MTU lowers the netdev,
+     * a new router interface with a smaller MTU lowers it further, and removing that interface
+     * raises it again. A notification that leaves the minimum alone issues no command.
+     */
+    TEST_F(VxlanMgrTest, UnderlayMtuChangeIsFollowed)
+    {
+        setPortChannelUnderlay("9100");
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
+        ASSERT_EQ("9050", createdMtu());
 
-        /* The update was consumed: a second doTask() does nothing more */
+        mockCallArgs.clear();
+        setConfig(CFG_LAG_TABLE_NAME, "PortChannel2", { {"admin_status", "up"}, {"mtu", "9000"} });
+        EXPECT_EQ(1u, countCmds(setMtuCmd("8950"))) << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("8950", cachedMtu("Vlan100"));
+
+        /* Applied: nothing more on the next pass, nor for an unrelated change */
         mockCallArgs.clear();
         m_vxlanMgr->doTask();
+        setConfig(CFG_LAG_TABLE_NAME, "PortChannel2", { {"admin_status", "down"}, {"mtu", "9000"} });
+        setConfig(CFG_PORT_TABLE_NAME, "Ethernet0", { {"mtu", "1500"} });
         EXPECT_TRUE(mockCallArgs.empty()) << ::testing::PrintToString(mockCallArgs);
 
-        /* An unmapped VLAN produces no netdev commands */
-        updateVlan("Vlan300", { {"vlanid", "300"}, {"mtu", "1500"} });
-        EXPECT_TRUE(mockCallArgs.empty()) << ::testing::PrintToString(mockCallArgs);
+        /* Ethernet0 becomes a router port */
+        setConfig(CFG_INTF_TABLE_NAME, "Ethernet0|10.2.0.0/31", {});
+        EXPECT_EQ(1u, countCmds(setMtuCmd("1450"))) << ::testing::PrintToString(mockCallArgs);
+
+        mockCallArgs.clear();
+        delConfig(CFG_INTF_TABLE_NAME, "Ethernet0|10.2.0.0/31");
+        EXPECT_EQ(1u, countCmds(setMtuCmd("8950"))) << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("8950", cachedMtu("Vlan100"));
     }
 
-    /* Deleting the map removes the netdev, and a later VLAN MTU change no longer touches it. */
-    TEST_F(VxlanMgrTest, VlanMtuChangeAfterMapDeleteIsIgnored)
+    /*
+     * The VLAN MTU doesn't size the netdev: a VLAN with a smaller MTU still gets the underlay-
+     * derived netdev (its SVI enforces its own MTU), and vxlanmgrd no longer watches VLAN.
+     */
+    TEST_F(VxlanMgrTest, VlanMtuDoesNotSizeNetdev)
     {
-        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "9000"} });
+        setPortChannelUnderlay("9100");
+        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "1500"} });
+        EXPECT_EQ("9050", createdMtu()) << linkAddCmd("vtep-100");
+        EXPECT_EQ(nullptr, m_vxlanMgr->getExecutor(CFG_VLAN_TABLE_NAME));
+    }
+
+    /* An mtu that is not a number is not interpolated into a shell command; the default is used. */
+    TEST_F(VxlanMgrTest, InvalidUnderlayMtuIsIgnored)
+    {
+        setConfig(CFG_LAG_TABLE_NAME, "PortChannel2", { {"mtu", "9000; touch /tmp/x"} });
+        setConfig(CFG_LAG_INTF_TABLE_NAME, "PortChannel2|10.1.0.0/31", {});
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
+
+        EXPECT_EQ("9050", createdMtu()) << linkAddCmd("vtep-100");
+        for (const auto &cmd : mockCallArgs)
+        {
+            EXPECT_EQ(string::npos, cmd.find("touch")) << cmd;
+        }
+    }
+
+    /* Deleting the map removes the netdev, and a later underlay change no longer touches it. */
+    TEST_F(VxlanMgrTest, UnderlayChangeAfterMapDeleteIsIgnored)
+    {
+        setPortChannelUnderlay("9100");
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
         ASSERT_NE("", linkAddCmd("vtep-100"));
 
-        m_cfgTunnelMapTable->del(TUNNEL + "|map_100_Vlan100");
-        auto consumer = dynamic_cast<Consumer *>(m_vxlanMgr->getExecutor(CFG_VXLAN_TUNNEL_MAP_TABLE_NAME));
-        ASSERT_NE(nullptr, consumer);
-        consumer->addToSync({ TUNNEL + "|map_100_Vlan100", DEL_COMMAND, {} });
         mockCallArgs.clear();
-        m_vxlanMgr->doTask();
+        delConfig(CFG_VXLAN_TUNNEL_MAP_TABLE_NAME, TUNNEL + "|map_100_Vlan100");
         EXPECT_EQ(1u, countCmds(string(IP_CMD) + " link del dev vtep-100"))
             << ::testing::PrintToString(mockCallArgs);
 
         mockCallArgs.clear();
-        updateVlan("Vlan100", { {"vlanid", "100"}, {"mtu", "1600"} });
+        setConfig(CFG_LAG_TABLE_NAME, "PortChannel2", { {"mtu", "9000"} });
         EXPECT_TRUE(mockCallArgs.empty()) << ::testing::PrintToString(mockCallArgs);
     }
 
     /*
-     * A failed "ip link set ... mtu" is not recorded as applied: the update stays pending and is
-     * retried, and a repeated notification with the same MTU is not skipped as already applied.
+     * A failed "ip link set ... mtu" is not recorded as applied: it is retried on the next
+     * doTask() pass (vxlanmgrd runs one on every select timeout) until it succeeds.
      */
-    TEST_F(VxlanMgrTest, FailedVlanMtuChangeIsRetried)
+    TEST_F(VxlanMgrTest, FailedUnderlayMtuChangeIsRetried)
     {
-        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "9000"} });
-        ASSERT_NE("", linkAddCmd("vtep-100"));
+        setPortChannelUnderlay("9100");
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
+        ASSERT_EQ("9050", createdMtu());
         callback = recordingExec;
-        const string setMtu = string(IP_CMD) + " link set dev vtep-100 mtu 1600";
 
-        /* The first attempt and its retry fail */
+        /* The first attempt and its first retry fail */
         g_failMtuSets = 2;
         mockCallArgs.clear();
-        updateVlan("Vlan100", { {"vlanid", "100"}, {"mtu", "1600"} });
-        EXPECT_EQ(1u, countCmds(setMtu)) << ::testing::PrintToString(mockCallArgs);
-        EXPECT_EQ("9000", cachedMtu("Vlan100"));
+        setConfig(CFG_LAG_TABLE_NAME, "PortChannel2", { {"mtu", "9000"} });
+        EXPECT_EQ(1u, countCmds(setMtuCmd("8950"))) << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("9050", cachedMtu("Vlan100"));
 
         mockCallArgs.clear();
         m_vxlanMgr->doTask();
-        EXPECT_EQ(1u, countCmds(setMtu)) << "failed update was not retried: "
-                                         << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ(1u, countCmds(setMtuCmd("8950"))) << "failed update was not retried: "
+                                                    << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("9050", cachedMtu("Vlan100"));
 
-        /* The same MTU notified again is applied, not skipped by the cache */
         mockCallArgs.clear();
-        updateVlan("Vlan100", { {"vlanid", "100"}, {"mtu", "1600"} });
-        EXPECT_EQ(1u, countCmds(setMtu)) << ::testing::PrintToString(mockCallArgs);
-        EXPECT_EQ("1600", cachedMtu("Vlan100"));
+        m_vxlanMgr->doTask();
+        EXPECT_EQ(1u, countCmds(setMtuCmd("8950"))) << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("8950", cachedMtu("Vlan100"));
 
-        /* Once applied the task is gone */
+        /* Once applied nothing is pending */
         mockCallArgs.clear();
         m_vxlanMgr->doTask();
         EXPECT_TRUE(mockCallArgs.empty()) << ::testing::PrintToString(mockCallArgs);
@@ -298,19 +418,18 @@ namespace vxlanmgr_ut
 
     /*
      * Warm restart: a netdev left by the previous run (possibly an image without this fix, so at
-     * MTU 1500) is reconciled, not re-created, and gets the VLAN's MTU.
+     * MTU 1500) is reconciled, not re-created, and gets the underlay-derived MTU.
      */
-    TEST_F(VxlanMgrTest, WarmReconciledNetdevGetsVlanMtu)
+    TEST_F(VxlanMgrTest, WarmReconciledNetdevGetsUnderlayMtu)
     {
-        restartWithExistingNetdevs(
-            "86: vtep-100: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master Bridge state UNKNOWN mode DEFAULT group default qlen 1000\n");
+        setPortChannelUnderlay("9100");
+        restartWithExistingNetdevs(NETDEV_LINK_1500);
         ASSERT_EQ(1u, m_vxlanMgr->m_vxlanNetDevices.count("vtep-100"));
 
-        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "9000"} });
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
         EXPECT_EQ("", linkAddCmd("vtep-100")) << "reconciled netdev was re-created";
-        EXPECT_EQ(1u, countCmds(string(IP_CMD) + " link set dev vtep-100 mtu 9000"))
-            << ::testing::PrintToString(mockCallArgs);
-        EXPECT_EQ("9000", cachedMtu("Vlan100"));
+        EXPECT_EQ(1u, countCmds(setMtuCmd("9050"))) << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("9050", cachedMtu("Vlan100"));
 
         /* Ending the reconcile window keeps the reconciled netdev */
         mockCallArgs.clear();
@@ -321,12 +440,11 @@ namespace vxlanmgr_ut
     /* Warm restart where setting the MTU on the reconciled netdev fails: it is retried. */
     TEST_F(VxlanMgrTest, WarmReconciledNetdevMtuFailureIsRetried)
     {
-        restartWithExistingNetdevs(
-            "86: vtep-100: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master Bridge state UNKNOWN mode DEFAULT group default qlen 1000\n");
-        const string setMtu = string(IP_CMD) + " link set dev vtep-100 mtu 9000";
+        setPortChannelUnderlay("9100");
+        restartWithExistingNetdevs(NETDEV_LINK_1500);
 
         g_failMtuSets = 1;
-        createMapping("Vlan100", "100", { {"vlanid", "100"}, {"mtu", "9000"} });
+        createMapping("Vlan100", "100", { {"vlanid", "100"} });
         EXPECT_EQ("", linkAddCmd("vtep-100")) << "reconciled netdev was re-created";
         /* Not recorded as applied */
         EXPECT_EQ("", cachedMtu("Vlan100"));
@@ -334,8 +452,8 @@ namespace vxlanmgr_ut
         mockCallArgs.clear();
         m_vxlanMgr->endReconcile(true);
         m_vxlanMgr->doTask();
-        EXPECT_EQ(1u, countCmds(setMtu)) << "MTU was not retried: " << ::testing::PrintToString(mockCallArgs);
-        EXPECT_EQ("9000", cachedMtu("Vlan100"));
+        EXPECT_EQ(1u, countCmds(setMtuCmd("9050"))) << "MTU was not retried: " << ::testing::PrintToString(mockCallArgs);
+        EXPECT_EQ("9050", cachedMtu("Vlan100"));
 
         mockCallArgs.clear();
         m_vxlanMgr->doTask();

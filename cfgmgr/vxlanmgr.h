@@ -42,6 +42,8 @@ public:
         std::string vxlan_dev_name;
         std::string vlan;
         std::string vni_id;
+        std::string src_ip;
+        // MTU applied to the netdev, "" if unknown
         std::string mtu;
     } MapCache;
 
@@ -50,6 +52,7 @@ public:
     void endReconcile(bool warm);
     void restoreVxlanNetDevices();
     bool isTunnelActive(std::string vxlanTunnelName);
+    void doTask() override;
 
     ~VxlanMgr();
 private:
@@ -67,8 +70,12 @@ private:
     bool doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t);
     bool doVxlanEvpnNvoDeleteTask(const KeyOpFieldsValuesTuple & t);
 
-    bool doVlanSetTask(const KeyOpFieldsValuesTuple & t);
-    void retryVlanMtu(const std::string & vlan);
+    static bool isUnderlayTable(const std::string & table_name);
+    bool getPhysicalMtu(const std::string & intf, int & mtu);
+    int getUnderlayMtu();
+    std::string getVxlanNetdevMtu(const std::string & src_ip, int underlay_mtu);
+    std::string getVxlanNetdevMtu(const std::string & src_ip);
+    bool syncNetdevMtus();
 
     void createAppDBTunnelMapTable(const KeyOpFieldsValuesTuple & t);
     void delAppDBTunnelMapTable(std::string vxlanTunnelMapName);
@@ -76,7 +83,6 @@ private:
                              std::string src_ip, std::string dst_ip, std::string vlan_id,
                              std::string mtu);
     int setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std::string & mtu);
-    std::string getVlanMtu(const std::string & vlan);
     int downVxlanNetdevice(std::string vxlan_dev_name);
     int deleteVxlanNetdevice(std::string vxlan_dev_name);
     std::vector<std::string> parseNetDev(const std::string& stdout);
@@ -101,7 +107,8 @@ private:
 
     ProducerStateTable m_appVxlanTunnelTableProducer, m_appVxlanTunnelMapTable,m_appEvpnNvoTable;
     Table m_cfgVxlanTunnelTable,m_cfgVnetTable,m_stateVrfTable,m_stateVxlanTable, m_appSwitchTable, m_appVxlanTunnelTable;
-    Table m_stateVlanTable, m_stateNeighSuppressVlanTable, m_stateVxlanTunnelTable, m_cfgVlanTable;
+    Table m_stateVlanTable, m_stateNeighSuppressVlanTable, m_stateVxlanTunnelTable;
+    Table m_cfgPortTable, m_cfgLagTable, m_cfgIntfTable, m_cfgLagIntfTable, m_cfgSubIntfTable;
 
     /*
     * Vxlan Tunnel Cache
@@ -125,6 +132,10 @@ private:
     bool m_in_reconcile;
     std::vector<std::string> m_appVxlanTunnelMapKeysRecon;
     std::map<std::string, std::string> m_vxlanNetDevices;
+
+    // Underlay MTU last seen by syncNetdevMtus(), and whether a netdev MTU update failed
+    int m_underlayMtu = 0;
+    bool m_netdevMtuPending = false;
 };
 
 }

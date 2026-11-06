@@ -324,6 +324,7 @@ tests_teammgrd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -ldl -lhiredis \
 
 tests_vxlanmgrd_SOURCES = vxlanmgrd/vxlanmgr_ut.cpp \
                           $(top_srcdir)/cfgmgr/vxlanmgr.cpp \
+                          $(top_srcdir)/lib/subintf.cpp \
                           $(top_srcdir)/lib/recorder.cpp \
                           $(top_srcdir)/orchagent/orch.cpp \
                           $(top_srcdir)/orchagent/request_parser.cpp \

@@ -1,7 +1,10 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cctype>
+#include <climits>
+#include <cstring>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <net/if.h>
@@ -16,6 +19,7 @@
 #include "tokenize.h"
 #include "shellcmd.h"
 #include "warm_restart.h"
+#include "subintf.h"
 
 using namespace std;
 using namespace swss;
@@ -40,9 +44,16 @@ extern MacAddress gMacAddress;
 #define DST_IP "dst_ip"
 #define SOURCE_VTEP "source_vtep"
 #define MTU "mtu"
+#define VRF_NAME "vrf_name"
 
-// Same default as vlanmgrd uses for the Bridge and for VLANs without an explicit mtu
-#define DEFAULT_MTU_STR "9100"
+// Same default as portmgrd, teammgrd and intfmgrd use for interfaces without an explicit mtu
+#define DEFAULT_MTU 9100
+// What VXLAN adds to an inner frame of <netdev MTU> bytes: outer IP header, UDP (8), VXLAN (8)
+// and the inner Ethernet header (14). The netdev is an untagged bridge port: no inner 802.1Q.
+#define VXLAN_OVERHEAD_IPV4 50  // 20 + 8 + 8 + 14
+#define VXLAN_OVERHEAD_IPV6 70  // 40 + 8 + 8 + 14
+// Smallest MTU the kernel accepts on an Ethernet-type netdev (ETH_MIN_MTU)
+#define MIN_NETDEV_MTU 68
 
 static std::string getVxlanName(const swss::VxlanMgr::VxlanInfo & info)
 {
@@ -239,7 +250,11 @@ VxlanMgr::VxlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb,
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
         m_stateNeighSuppressVlanTable(stateDb, STATE_NEIGH_SUPPRESS_VLAN_TABLE_NAME),
         m_stateVxlanTunnelTable(stateDb, STATE_VXLAN_TUNNEL_TABLE_NAME),
-        m_cfgVlanTable(cfgDb, CFG_VLAN_TABLE_NAME)
+        m_cfgPortTable(cfgDb, CFG_PORT_TABLE_NAME),
+        m_cfgLagTable(cfgDb, CFG_LAG_TABLE_NAME),
+        m_cfgIntfTable(cfgDb, CFG_INTF_TABLE_NAME),
+        m_cfgLagIntfTable(cfgDb, CFG_LAG_INTF_TABLE_NAME),
+        m_cfgSubIntfTable(cfgDb, CFG_VLAN_SUB_INTF_TABLE_NAME)
 {
     getAllVxlanNetDevices();
 
@@ -261,6 +276,16 @@ void VxlanMgr::doTask(Consumer &consumer)
     SWSS_LOG_ENTER();
 
     const string & table_name = consumer.getTableName();
+
+    if (isUnderlayTable(table_name))
+    {
+        // Only the resulting underlay MTU matters, not the individual entries: recompute it
+        // once for the whole batch. A failed netdev update is retried from doTask().
+        consumer.m_toSync.clear();
+        syncNetdevMtus();
+        return;
+    }
+
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
@@ -286,10 +311,6 @@ void VxlanMgr::doTask(Consumer &consumer)
             {
                 task_result = doVxlanEvpnNvoCreateTask(t);
             }
-            else if (table_name == CFG_VLAN_TABLE_NAME)
-            {
-                task_result = doVlanSetTask(t);
-            }
             else
             {
                 SWSS_LOG_ERROR("Unknown table : %s", table_name.c_str());
@@ -312,11 +333,6 @@ void VxlanMgr::doTask(Consumer &consumer)
             else if (table_name == CFG_VXLAN_EVPN_NVO_TABLE_NAME)
             {
                 task_result = doVxlanEvpnNvoDeleteTask(t);
-            }
-            else if (table_name == CFG_VLAN_TABLE_NAME)
-            {
-                // The VXLAN netdev is removed with its tunnel map, nothing to do here
-                task_result = true;
             }
             else
             {
@@ -651,7 +667,7 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
         return true;
     }
 
-    const std::string mtu = getVlanMtu(vlan);
+    const std::string mtu = getVxlanNetdevMtu(src_ip);
 
     createAppDBTunnelMapTable(t);
     ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id, mtu);
@@ -673,7 +689,8 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
     map_entry.vxlan_dev_name = vxlan_dev_name;
     map_entry.vlan = vlan;
     map_entry.vni_id = vni_id;
-    // An empty mtu means "not applied": doVlanSetTask() then sets it on the retry below
+    map_entry.src_ip = src_ip;
+    // An empty mtu means "not applied": syncNetdevMtus() sets it on the next doTask()
     map_entry.mtu = (ret == RET_MTU_NOT_SET) ? "" : mtu;
 
     m_vxlanTunnelMapCache[vxlanTunnelMapName] = map_entry;
@@ -683,7 +700,7 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
 
     if (ret == RET_MTU_NOT_SET)
     {
-        retryVlanMtu(vlan);
+        m_netdevMtuPending = true;
     }
 
     //Inform the Vlan Mgr to update the tunnel flags if Arp/Nd Suppression is set.
@@ -1068,8 +1085,8 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
             m_vxlanNetDevices.erase(it);
             SWSS_LOG_INFO("Reconcile VxlanNetDevice %s reconciled. Pending %zu",
                             vxlan_dev_name.c_str(), m_vxlanNetDevices.size());
-            // The device survived a warm restart; make sure it carries the VLAN MTU
-            // (it may have been created by an image that left it at the kernel default).
+            // The device survived a warm restart; make sure it carries the underlay-derived
+            // MTU (it may have been created by an image that left it at the kernel default).
             if (setVxlanNetdeviceMtu(vxlan_dev_name, mtu) != RET_SUCCESS)
             {
                 return RET_MTU_NOT_SET;
@@ -1105,7 +1122,7 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
 
     // Without an explicit mtu the kernel gives the VXLAN netdev 1500 while the Bridge and
     // the VlanN interfaces carry the VLAN MTU; the bridge then drops every CPU-terminated
-    // overlay frame above 1500 bytes at this port. Use the VLAN's MTU instead.
+    // overlay frame above 1500 bytes at this port. Size it for the underlay instead.
     link_add_cmd = std::string("") + IP_CMD + " link add " + vxlan_dev_name +
                    " address " + gMacAddress.to_string() +
                    " mtu " + mtu + " type vxlan id " +
@@ -1182,43 +1199,10 @@ int VxlanMgr::setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std
     return swss::exec(cmd, res);
 }
 
-/* The VLAN's configured MTU (CONFIG_DB VLAN|<vlan> mtu), or the SONiC default if unset */
-std::string VxlanMgr::getVlanMtu(const std::string & vlan)
+/* An interface's MTU from its CONFIG_DB row: the mtu field, or the SONiC default if unset */
+static int getConfiguredMtu(const std::vector<FieldValueTuple> & fvs, const std::string & intf)
 {
-    std::vector<FieldValueTuple> fvs;
-    if (m_cfgVlanTable.get(vlan, fvs))
-    {
-        for (const auto & fv : fvs)
-        {
-            if (fvField(fv) != MTU)
-            {
-                continue;
-            }
-            if (isValidMtu(fvValue(fv)))
-            {
-                return fvValue(fv);
-            }
-            SWSS_LOG_WARN("Ignoring invalid mtu '%s' of %s, using %s",
-                          fvValue(fv).c_str(), vlan.c_str(), DEFAULT_MTU_STR);
-        }
-    }
-    return DEFAULT_MTU_STR;
-}
-
-/* Keep the MTU of a mapped VLAN's VXLAN netdev in sync with the VLAN's MTU */
-bool VxlanMgr::doVlanSetTask(const KeyOpFieldsValuesTuple & t)
-{
-    SWSS_LOG_ENTER();
-
-    const std::string & vlan = kfvKey(t);
-    if (m_vlanMapCache.find(vlan) == m_vlanMapCache.end())
-    {
-        // No VNI mapped (yet): the MTU is read when the map and the netdev are created
-        return true;
-    }
-
-    std::string mtu = DEFAULT_MTU_STR;
-    for (const auto & fv : kfvFieldsValues(t))
+    for (const auto & fv : fvs)
     {
         if (fvField(fv) != MTU)
         {
@@ -1226,28 +1210,145 @@ bool VxlanMgr::doVlanSetTask(const KeyOpFieldsValuesTuple & t)
         }
         if (isValidMtu(fvValue(fv)))
         {
-            mtu = fvValue(fv);
+            return std::stoi(fvValue(fv));
+        }
+        SWSS_LOG_WARN("Ignoring invalid mtu '%s' of %s, using %d",
+                      fvValue(fv).c_str(), intf.c_str(), DEFAULT_MTU);
+    }
+    return DEFAULT_MTU;
+}
+
+/* The interfaces with an entry in <intfTable> that are in the default VRF (no vrf_name) */
+static std::set<std::string> getDefaultVrfInterfaces(Table & intfTable)
+{
+    std::vector<std::string> keys;
+    intfTable.getKeys(keys);
+
+    std::set<std::string> intfs;
+    for (const auto & key : keys)
+    {
+        // "Ethernet0" (the interface's attributes) or "Ethernet0|10.0.0.0/31" (an address)
+        intfs.insert(key.substr(0, key.find(config_db_key_delimiter)));
+    }
+    for (auto it = intfs.begin(); it != intfs.end();)
+    {
+        std::string vrf;
+        if (intfTable.hget(*it, VRF_NAME, vrf) && !vrf.empty() && vrf != "default")
+        {
+            it = intfs.erase(it);
         }
         else
         {
-            SWSS_LOG_WARN("Ignoring invalid mtu '%s' of %s, using %s",
-                          fvValue(fv).c_str(), vlan.c_str(), DEFAULT_MTU_STR);
+            ++it;
         }
+    }
+    return intfs;
+}
+
+bool VxlanMgr::isUnderlayTable(const std::string & table_name)
+{
+    return table_name == CFG_PORT_TABLE_NAME ||
+           table_name == CFG_LAG_TABLE_NAME ||
+           table_name == CFG_INTF_TABLE_NAME ||
+           table_name == CFG_LAG_INTF_TABLE_NAME ||
+           table_name == CFG_VLAN_SUB_INTF_TABLE_NAME;
+}
+
+/* The configured MTU of a port or PortChannel, false if it has no CONFIG_DB entry */
+bool VxlanMgr::getPhysicalMtu(const std::string & intf, int & mtu)
+{
+    Table & table = (intf.compare(0, strlen("PortChannel"), "PortChannel") == 0) ? m_cfgLagTable : m_cfgPortTable;
+    std::vector<FieldValueTuple> fvs;
+    if (!table.get(intf, fvs))
+    {
+        return false;
+    }
+    mtu = getConfiguredMtu(fvs, intf);
+    return true;
+}
+
+/*
+ * The underlay MTU: the smallest MTU of the default-VRF router interfaces that VXLAN packets
+ * can leave through, i.e. the ports in INTERFACE, the PortChannels in PORTCHANNEL_INTERFACE
+ * and the sub-interfaces in VLAN_SUB_INTERFACE (capped by their parent, like intfmgrd does).
+ *
+ * VLAN SVIs are left out: they are the overlay side of the VTEP, and a tenant SVI with a small
+ * MTU must not shrink every VXLAN netdev. Loopbacks are left out too: the source VTEP address
+ * lives there, but no packet leaves through one. Without any such interface the SONiC default.
+ */
+int VxlanMgr::getUnderlayMtu()
+{
+    int underlay = INT_MAX;
+    int mtu;
+
+    for (Table * intfTable : { &m_cfgIntfTable, &m_cfgLagIntfTable })
+    {
+        for (const auto & intf : getDefaultVrfInterfaces(*intfTable))
+        {
+            if (getPhysicalMtu(intf, mtu))
+            {
+                underlay = std::min(underlay, mtu);
+            }
+        }
+    }
+
+    for (const auto & alias : getDefaultVrfInterfaces(m_cfgSubIntfTable))
+    {
+        subIntf subIf(alias);
+        if (!subIf.isValid() || !getPhysicalMtu(subIf.parentIntf(), mtu))
+        {
+            continue;
+        }
+        std::vector<FieldValueTuple> fvs;
+        m_cfgSubIntfTable.get(alias, fvs);
+        underlay = std::min(underlay, std::min(mtu, getConfiguredMtu(fvs, alias)));
+    }
+
+    return (underlay == INT_MAX) ? DEFAULT_MTU : underlay;
+}
+
+/* The MTU for a VXLAN netdev with source VTEP <src_ip>: the underlay MTU minus the encapsulation */
+std::string VxlanMgr::getVxlanNetdevMtu(const std::string & src_ip, int underlay_mtu)
+{
+    const bool ipv6 = src_ip.find(':') != std::string::npos;
+    const int mtu = underlay_mtu - (ipv6 ? VXLAN_OVERHEAD_IPV6 : VXLAN_OVERHEAD_IPV4);
+    return std::to_string(std::max(mtu, MIN_NETDEV_MTU));
+}
+
+std::string VxlanMgr::getVxlanNetdevMtu(const std::string & src_ip)
+{
+    return getVxlanNetdevMtu(src_ip, getUnderlayMtu());
+}
+
+/*
+ * Bring the MTU of every VXLAN netdev in line with the current underlay MTU. Only a successful
+ * "ip link set" is recorded; a failed one leaves the update pending for doTask() to retry.
+ */
+bool VxlanMgr::syncNetdevMtus()
+{
+    SWSS_LOG_ENTER();
+
+    const int underlay = getUnderlayMtu();
+    if (underlay != m_underlayMtu)
+    {
+        SWSS_LOG_NOTICE("Underlay MTU is %d", underlay);
+        m_underlayMtu = underlay;
     }
 
     bool applied = true;
     for (auto & map : m_vxlanTunnelMapCache)
     {
         MapCache & map_entry = map.second;
-        if (map_entry.vlan != vlan || map_entry.mtu == mtu)
+        const std::string mtu = getVxlanNetdevMtu(map_entry.src_ip, underlay);
+        if (map_entry.mtu == mtu)
         {
             continue;
         }
-        SWSS_LOG_NOTICE("Setting MTU %s on VxlanNetDevice %s for %s",
-                        mtu.c_str(), map_entry.vxlan_dev_name.c_str(), vlan.c_str());
+        SWSS_LOG_NOTICE("Setting MTU %s on VxlanNetDevice %s (underlay MTU %d)",
+                        mtu.c_str(), map_entry.vxlan_dev_name.c_str(), underlay);
         if (setVxlanNetdeviceMtu(map_entry.vxlan_dev_name, mtu) != RET_SUCCESS)
         {
-            // Keep the task so it is retried; the cache still holds the MTU the kernel has
+            // The cache still holds the MTU the kernel has, so the retry is not skipped
             SWSS_LOG_WARN("Failed to set MTU %s on VxlanNetDevice %s, retrying",
                           mtu.c_str(), map_entry.vxlan_dev_name.c_str());
             applied = false;
@@ -1255,21 +1356,19 @@ bool VxlanMgr::doVlanSetTask(const KeyOpFieldsValuesTuple & t)
         }
         map_entry.mtu = mtu;
     }
+    m_netdevMtuPending = !applied;
     return applied;
 }
 
-/* Queue the VLAN's current CONFIG_DB entry so doVlanSetTask() (re)applies its MTU */
-void VxlanMgr::retryVlanMtu(const std::string & vlan)
+/* vxlanmgrd calls this on every select timeout: also retry a failed netdev MTU update, once per pass */
+void VxlanMgr::doTask()
 {
-    auto consumer = dynamic_cast<Consumer *>(getExecutor(CFG_VLAN_TABLE_NAME));
-    if (consumer == nullptr)
+    if (m_netdevMtuPending)
     {
-        SWSS_LOG_WARN("No %s consumer, cannot retry the MTU of %s", CFG_VLAN_TABLE_NAME, vlan.c_str());
-        return;
+        syncNetdevMtus();
     }
-    std::vector<FieldValueTuple> fvs;
-    m_cfgVlanTable.get(vlan, fvs);
-    consumer->addToSync(KeyOpFieldsValuesTuple(vlan, SET_COMMAND, fvs));
+
+    Orch::doTask();
 }
 
 std::vector<std::string> VxlanMgr::parseNetDev(const string& stdout){
@@ -1401,7 +1500,7 @@ void VxlanMgr::restoreVxlanNetDevices()
         const auto vxlanTunnelName = vxlanTunnelMapName.substr(0, found);
 
         int ret;
-        ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id, getVlanMtu(vlan));
+        ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id, getVxlanNetdevMtu(src_ip));
         if (ret != RET_SUCCESS)
         {
             SWSS_LOG_WARN("Vxlan Net Dev creation failure for %s VNI(%s) VLAN(%s)",
