@@ -1,4 +1,5 @@
 #include <string.h>
+#include <cstdint>
 #include "logger.h"
 #include "producerstatetable.h"
 #include "macaddress.h"
@@ -191,7 +192,9 @@ bool VlanMgr::setHostVlanMtu(int vlan_id, uint32_t mtu)
         return true;
     }
 
-    /* VLAN mtu should not be larger than member mtu */
+    /* The kernel refuses an mtu larger than the Bridge's (ERANGE) */
+    SWSS_LOG_ERROR("Failed to set %s%d mtu %u, cmd: %s, rc: %d, error: %s",
+                   VLAN_PREFIX, vlan_id, mtu, cmds.c_str(), ret, res.c_str());
     return false;
 }
 
@@ -398,12 +401,6 @@ void VlanMgr::doVlanTask(Consumer &consumer)
                 else if (fvField(i) == "mtu")
                 {
                     mtu = fvValue(i);
-                    /*
-                     * TODO: support host VLAN mtu setting.
-                     * Host VLAN mtu should be set only after member configured
-                     * and VLAN state is not UNKNOWN.
-                     */
-                    SWSS_LOG_DEBUG("%s mtu %s: Host VLAN mtu setting to be supported.", key.c_str(), mtu.c_str());
                 }
                 else if (fvField(i) == "members@") {
                     members = fvValue(i);
@@ -418,6 +415,32 @@ void VlanMgr::doVlanTask(Consumer &consumer)
                     hostif_name = fvValue(i);
                 }
             }
+            /*
+             * Set the host VLAN mtu, on creation and on every change. The
+             * VLAN netdev sits on the Bridge, whose mtu is fixed at
+             * DEFAULT_MTU_STR, so its members don't cap it. Without an mtu
+             * field the VLAN goes back to the default, as in APPL_DB below.
+             */
+            uint32_t mtu_value = 0;
+            try
+            {
+                size_t pos = 0;
+                unsigned long v = stoul(mtu, &pos);
+                if (pos != mtu.size() || v == 0 || v > UINT32_MAX)
+                {
+                    throw std::invalid_argument(mtu);
+                }
+                mtu_value = static_cast<uint32_t>(v);
+            }
+            catch (...)
+            {
+                SWSS_LOG_ERROR("%s: invalid mtu '%s', not setting it on the host VLAN", key.c_str(), mtu.c_str());
+            }
+            if (mtu_value != 0)
+            {
+                setHostVlanMtu(vlan_id, mtu_value);
+            }
+
             /* fvVector should not be empty */
             if (fvVector.empty())
             {
