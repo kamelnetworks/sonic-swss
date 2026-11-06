@@ -42,7 +42,6 @@ public:
         std::string vxlan_dev_name;
         std::string vlan;
         std::string vni_id;
-        std::string src_ip;
         // MTU applied to the netdev, "" if unknown
         std::string mtu;
     } MapCache;
@@ -70,18 +69,12 @@ private:
     bool doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t);
     bool doVxlanEvpnNvoDeleteTask(const KeyOpFieldsValuesTuple & t);
 
-    static bool isUnderlayTable(const std::string & table_name);
-    bool getPhysicalMtu(const std::string & intf, int & mtu);
-    int getUnderlayMtu();
-    std::string getVxlanNetdevMtu(const std::string & src_ip, int underlay_mtu);
-    std::string getVxlanNetdevMtu(const std::string & src_ip);
     bool syncNetdevMtus();
 
     void createAppDBTunnelMapTable(const KeyOpFieldsValuesTuple & t);
     void delAppDBTunnelMapTable(std::string vxlanTunnelMapName);
     int createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_id,
-                             std::string src_ip, std::string dst_ip, std::string vlan_id,
-                             std::string mtu);
+                             std::string src_ip, std::string dst_ip, std::string vlan_id);
     int setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std::string & mtu);
     int downVxlanNetdevice(std::string vxlan_dev_name);
     int deleteVxlanNetdevice(std::string vxlan_dev_name);
@@ -108,7 +101,6 @@ private:
     ProducerStateTable m_appVxlanTunnelTableProducer, m_appVxlanTunnelMapTable,m_appEvpnNvoTable;
     Table m_cfgVxlanTunnelTable,m_cfgVnetTable,m_stateVrfTable,m_stateVxlanTable, m_appSwitchTable, m_appVxlanTunnelTable;
     Table m_stateVlanTable, m_stateNeighSuppressVlanTable, m_stateVxlanTunnelTable;
-    Table m_cfgPortTable, m_cfgLagTable, m_cfgIntfTable, m_cfgLagIntfTable, m_cfgSubIntfTable;
 
     /*
     * Vxlan Tunnel Cache
@@ -133,8 +125,7 @@ private:
     std::vector<std::string> m_appVxlanTunnelMapKeysRecon;
     std::map<std::string, std::string> m_vxlanNetDevices;
 
-    // Underlay MTU last seen by syncNetdevMtus(), and whether a netdev MTU update failed
-    int m_underlayMtu = 0;
+    // Whether a netdev MTU update failed and is waiting for syncNetdevMtus() to retry it
     bool m_netdevMtuPending = false;
 };
 

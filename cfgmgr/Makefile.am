@@ -71,7 +71,7 @@ nbrmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(LIBNL
 nbrmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(LIBNL_CPPFLAGS) $(CFLAGS_ASAN)
 nbrmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS) $(LIBNL_LIBS)
 
-vxlanmgrd_SOURCES = vxlanmgrd.cpp vxlanmgr.cpp $(top_srcdir)/lib/subintf.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
+vxlanmgrd_SOURCES = vxlanmgrd.cpp vxlanmgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
 vxlanmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
 vxlanmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
 vxlanmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
