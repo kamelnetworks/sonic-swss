@@ -363,6 +363,34 @@ void VlanMgr::doVlanTask(Consumer &consumer)
             vector<FieldValueTuple> fvVector;
             string members;
 
+            // Validate before creating or changing the host VLAN, and before
+            // forwarding the value to APPL_DB.
+            for (const auto &fv : kfvFieldsValues(t))
+            {
+                if (fvField(fv) == "mtu")
+                {
+                    mtu = fvValue(fv);
+                }
+            }
+            uint32_t mtu_value = 0;
+            try
+            {
+                size_t pos = 0;
+                unsigned long v = stoul(mtu, &pos);
+                if (mtu.empty() || mtu.find_first_not_of("0123456789") != string::npos ||
+                    pos != mtu.size() || v == 0 || v > UINT32_MAX)
+                {
+                    throw std::invalid_argument(mtu);
+                }
+                mtu_value = static_cast<uint32_t>(v);
+            }
+            catch (...)
+            {
+                SWSS_LOG_ERROR("%s: invalid mtu '%s', discarding VLAN update", key.c_str(), mtu.c_str());
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
+
             /*
              * If state is already set for this vlan, but it doesn't exist in m_vlans set,
              * just add it to m_vlans set and remove the request to skip disrupting Linux vlan.
@@ -421,25 +449,7 @@ void VlanMgr::doVlanTask(Consumer &consumer)
              * DEFAULT_MTU_STR, so its members don't cap it. Without an mtu
              * field the VLAN goes back to the default, as in APPL_DB below.
              */
-            uint32_t mtu_value = 0;
-            try
-            {
-                size_t pos = 0;
-                unsigned long v = stoul(mtu, &pos);
-                if (pos != mtu.size() || v == 0 || v > UINT32_MAX)
-                {
-                    throw std::invalid_argument(mtu);
-                }
-                mtu_value = static_cast<uint32_t>(v);
-            }
-            catch (...)
-            {
-                SWSS_LOG_ERROR("%s: invalid mtu '%s', not setting it on the host VLAN", key.c_str(), mtu.c_str());
-            }
-            if (mtu_value != 0)
-            {
-                setHostVlanMtu(vlan_id, mtu_value);
-            }
+            setHostVlanMtu(vlan_id, mtu_value);
 
             /* fvVector should not be empty */
             if (fvVector.empty())

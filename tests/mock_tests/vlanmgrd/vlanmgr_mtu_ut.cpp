@@ -165,11 +165,24 @@ namespace vlanmgr_mtu_ut
     /* A malformed mtu never reaches the shell */
     TEST_F(VlanMgrMtuTest, InvalidMtuNotApplied)
     {
-        for (auto mtu : { "abc", "1600; reboot", "-1", "0", "99999999999" })
+        for (auto mtu : { "abc", "1600; reboot", "-1", "0", "99999999999", "+1600", " 1600", "" })
         {
             mockCallArgs.clear();
             setVlan({ { "vlanid", "100" }, { "mtu", mtu } });
             EXPECT_TRUE(mtuCommands().empty()) << mtu;
+            EXPECT_TRUE(mockCallArgs.empty()) << mtu;
+            EXPECT_TRUE(appMtu().empty()) << mtu;
+            EXPECT_EQ(m_vlanMgr->m_vlans.count(VLAN), 0);
         }
     }
+    TEST_F(VlanMgrMtuTest, InvalidMtuPreservesAcceptedState)
+    {
+        setVlan({ { "vlanid", "100" }, { "mtu", "1600" } });
+        mockCallArgs.clear();
+        setVlan({ { "vlanid", "100" }, { "mtu", "invalid" } });
+        EXPECT_TRUE(mockCallArgs.empty());
+        EXPECT_EQ(appMtu(), "1600");
+        EXPECT_EQ(m_vlanMgr->m_vlans.count(VLAN), 1);
+    }
+
 }
