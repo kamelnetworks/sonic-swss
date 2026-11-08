@@ -49,6 +49,7 @@ private:
     bool removeLag(const std::string &alias);
     task_process_status addLagMember(const std::string &lag, const std::string &member);
     bool removeLagMember(const std::string &lag, const std::string &member);
+    bool restoreLagMemberAttributes(const std::string &member);
 
     bool setLagAdminStatus(const std::string &alias, const std::string &admin_status);
     bool setLagMtu(const std::string &alias, const std::string &mtu);

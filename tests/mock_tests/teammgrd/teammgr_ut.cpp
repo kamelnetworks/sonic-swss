@@ -535,6 +535,7 @@ namespace teammgr_ut
     /* Nonzero: "ip -o link show dev <port>" fails with this status and prints mock_link_show_err */
     static int mock_link_show_rc = 0;
     static std::string mock_link_show_err;
+    static int mock_remove_rc = 0;
 
     static int cb_lag_member(const std::string &cmd, std::string &stdout)
     {
@@ -553,6 +554,12 @@ namespace teammgr_ut
             }
             stdout += "state DOWN mode DEFAULT group default qlen 1000\\    link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff\n";
             return 0;
+        }
+        if (cmd.find("port remove") != std::string::npos && mock_remove_rc != 0)
+        {
+            mockCallArgs.push_back(cmd);
+            stdout = "teamd removal failed";
+            return mock_remove_rc;
         }
         return cb(cmd, stdout);
     }
@@ -770,7 +777,7 @@ namespace teammgr_ut
         mock_link_show_rc = 0;
         mockCallArgs.clear();
         teammgr.doTask();
-        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl PortChannel99 port remove Ethernet0"));
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port remove \"Ethernet0\""));
         EXPECT_EQ(consumer->m_toSync.size(), 0);
         EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
     }
@@ -801,9 +808,97 @@ namespace teammgr_ut
         consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
         mockCallArgs.clear();
         teammgr.doTask();
-        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl PortChannel99 port remove Ethernet0"));
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port remove \"Ethernet0\""));
         EXPECT_EQ(consumer->m_toSync.size(), 0);
         EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    TEST_F(TeamMgrTest, testAppliedLagMemberDetachedBeforeDelete)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        callback = cb_lag_member;
+        mock_port_master = "";
+        swss::Table cfg_port(m_config_db.get(), CFG_PORT_TABLE_NAME);
+        cfg_port.set("Ethernet0", { { "mtu", "1500" }, { "admin_status", "down" } });
+        swss::Table cfg_lag(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag.set("PortChannel99", { { "mtu", "9000" } });
+        ASSERT_EQ(teammgr.addLagMember("PortChannel99", "Ethernet0"), task_success);
+        swss::Table app_port(m_app_db.get(), APP_PORT_TABLE_NAME);
+        std::string mtu;
+        app_port.hget("Ethernet0", "mtu", mtu);
+        ASSERT_EQ(mtu, "9000");
+
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port remove"));
+        EXPECT_TRUE(commandSeen("link set dev \"Ethernet0\" mtu \"1500\""));
+        app_port.hget("Ethernet0", "mtu", mtu);
+        EXPECT_EQ(mtu, "1500");
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+    }
+
+    TEST_F(TeamMgrTest, testAppliedLagMemberMovedOrLostBeforeDelete)
+    {
+        // Netlink removal drives teamd/teamsyncd cleanup. A stale teamdctl
+        // remove must not detach a new owner or recreate a missing APP_PORT.
+        for (const auto &owner : { "Bridge", "PortChannel100", "missing" })
+        {
+            swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+            callback = cb_lag_member;
+            mock_port_master = "";
+            mock_link_show_rc = 0;
+            ASSERT_EQ(teammgr.addLagMember("PortChannel99", "Ethernet0"), task_success);
+            swss::Table app_port(m_app_db.get(), APP_PORT_TABLE_NAME);
+            app_port.set("Ethernet0", { { "mtu", "1600" }, { "admin_status", "down" } });
+            mock_port_master = owner;
+            if (mock_port_master == "missing")
+            {
+                mock_link_show_rc = 1;
+                mock_link_show_err = "Device \"Ethernet0\" does not exist.\n";
+                app_port.del("Ethernet0");
+            }
+            auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+            ASSERT_NE(consumer, nullptr);
+            consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+            mockCallArgs.clear();
+            teammgr.doTask();
+            mock_link_show_rc = 0;
+            EXPECT_FALSE(commandSeen("port remove"));
+            EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+            EXPECT_EQ(consumer->m_toSync.size(), 0);
+            EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+            std::string mtu;
+            bool exists = app_port.hget("Ethernet0", "mtu", mtu);
+            EXPECT_EQ(exists, mock_port_master != "missing");
+            if (exists)
+            {
+                EXPECT_EQ(mtu, "1600");
+            }
+        }
+    }
+
+    TEST_F(TeamMgrTest, testLagMemberRemovalFailureRetried)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        callback = cb_lag_member;
+        mock_port_master = "PortChannel99";
+        mock_remove_rc = 1;
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+        EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+        mock_remove_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("port remove"));
+        EXPECT_TRUE(commandSeen("link set dev \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
     }
 
 }

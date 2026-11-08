@@ -408,10 +408,16 @@ void TeamMgr::doLagMemberTask(Consumer &consumer)
             {
                 removeLagMember(lag, member);
             }
+            else if (lookup == NetdevMasterLookup::FOUND && master.empty())
+            {
+                // The member may already have been detached externally, or
+                // by a previous removal whose attribute restoration failed.
+                restoreLagMemberAttributes(member);
+            }
             else
             {
-                // Never applied, already removed, or now owned elsewhere:
-                // don't reset attributes on another daemon's port.
+                // Missing or now owned elsewhere: don't recreate the port
+                // in APPL_DB or reset another daemon's port attributes.
                 SWSS_LOG_NOTICE("Port %s is not attached to port channel %s, skipping kernel removal",
                                 member.c_str(), lag.c_str());
             }
@@ -1049,8 +1055,18 @@ bool TeamMgr::removeLagMember(const string &lag, const string &member)
     string res;
 
     // teamdctl <port_channel_name> port remove <member>;
-    cmd << TEAMDCTL_CMD << " " << lag << " port remove " << member << "; ";
+    cmd << TEAMDCTL_CMD << " " << shellquote(lag) << " port remove " << shellquote(member);
+    EXEC_WITH_ERROR_THROW(cmd.str(), res);
+    restoreLagMemberAttributes(member);
 
+    SWSS_LOG_NOTICE("Remove %s from port channel %s", member.c_str(), lag.c_str());
+    return true;
+}
+
+bool TeamMgr::restoreLagMemberAttributes(const string &member)
+{
+    stringstream cmd;
+    string res;
     vector<FieldValueTuple> fvs;
     m_cfgPortTable.get(member, fvs);
 
@@ -1081,8 +1097,6 @@ bool TeamMgr::removeLagMember(const string &lag, const string &member)
     fv = FieldValueTuple("mtu", mtu);
     fvs.push_back(fv);
     m_appPortTable.set(member, fvs);
-
-    SWSS_LOG_NOTICE("Remove %s from port channel %s", member.c_str(), lag.c_str());
 
     return true;
 }
