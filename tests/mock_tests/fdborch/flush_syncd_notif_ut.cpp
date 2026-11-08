@@ -28,6 +28,7 @@ namespace fdb_syncd_flush_test
     sai_fdb_api_t ut_sai_fdb_api;
     sai_fdb_api_t *pold_sai_fdb_api;
     static int g_sai_flush_call_count = 0;
+    static sai_status_t g_sai_flush_result = SAI_STATUS_SUCCESS;
 
     sai_status_t _ut_stub_sai_create_fdb_entry (
         _In_ const sai_fdb_entry_t *fdb_entry,
@@ -43,7 +44,7 @@ namespace fdb_syncd_flush_test
         _In_ const sai_attribute_t *attr_list)
     {
         g_sai_flush_call_count++;
-        return SAI_STATUS_SUCCESS;
+        return g_sai_flush_result;
     }
 
     void _hook_sai_fdb_api()
@@ -57,6 +58,7 @@ namespace fdb_syncd_flush_test
     void _unhook_sai_fdb_api()
     {
         sai_fdb_api = pold_sai_fdb_api;
+        g_sai_flush_result = SAI_STATUS_SUCCESS;
     }
     struct FdbOrchTest : public ::testing::Test
     {   
@@ -306,6 +308,239 @@ namespace fdb_syncd_flush_test
         /* Final verification */
         ASSERT_EQ(g_sai_flush_call_count, 1);
         _unhook_sai_fdb_api();
+    }
+
+    // Supported recovery for a lost flush notification after bridge removal:
+    // an APP_FDB_TABLE DEL reaches the existing orphan cleanup before the
+    // configured-versus-learned origin check.
+    TEST_F(FdbOrchTest, AppDeleteRecoversFlushPendingOrphan)
+    {
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+        m_portsOrch->m_initDone = true;
+        auto bv = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        auto bp = m_portsOrch->m_portList[ETH0].m_bridge_port_id;
+        vector<uint8_t> mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xec};
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, mac, bp, bv);
+        FdbEntry entry;
+        entry.mac = MacAddress("7c:fe:90:12:22:ec");
+        entry.bv_id = bv;
+        ASSERT_EQ(m_fdborch->m_entries.at(entry).origin, FDB_ORIGIN_LEARN);
+        ASSERT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 1);
+
+        _hook_sai_fdb_api();
+        m_fdborch->flushFDBEntries(SAI_NULL_OBJECT_ID, bv);
+        _unhook_sai_fdb_api();
+        ASSERT_TRUE(m_fdborch->m_entries.at(entry).is_flush_pending);
+        m_portsOrch->m_portList[ETH0].m_bridge_port_id = SAI_NULL_OBJECT_ID;
+        m_portsOrch->saiOidToAlias.erase(bp);
+
+        auto consumer = dynamic_cast<Consumer *>(m_fdborch->getExecutor(APP_FDB_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(KeyOpFieldsValuesTuple{"Vlan40:7c:fe:90:12:22:ec", DEL_COMMAND, {}});
+        m_fdborch->doTask(*consumer);
+        EXPECT_TRUE(consumer->m_toSync.empty());
+        EXPECT_EQ(m_fdborch->m_entries.count(entry), 0);
+        EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+        EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 0);
+        string value;
+        EXPECT_FALSE(m_fdborch->m_fdbStateTable.hget("Vlan40:7c:fe:90:12:22:ec", "port", value));
+        m_fdborch->handleSyncdFlushNotif(bv, bp, entry.mac, SAI_FDB_ENTRY_TYPE_DYNAMIC);
+        EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+        EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 0);
+    }
+
+    TEST_F(FdbOrchTest, SuccessfulVlanFlushClearsOrphanWithoutNotification)
+    {
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+        auto bv = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        auto bp = m_portsOrch->m_portList[ETH0].m_bridge_port_id;
+        vector<uint8_t> mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xed};
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, mac, bp, bv);
+        FdbEntry entry;
+        entry.mac = MacAddress("7c:fe:90:12:22:ed");
+        entry.bv_id = bv;
+        m_portsOrch->m_portList[ETH0].m_bridge_port_id = SAI_NULL_OBJECT_ID;
+        m_portsOrch->saiOidToAlias.erase(bp);
+        _hook_sai_fdb_api();
+        m_fdborch->flushFDBEntries(SAI_NULL_OBJECT_ID, bv);
+        _unhook_sai_fdb_api();
+        EXPECT_TRUE(m_fdborch->m_entries.empty());
+        EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+        EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 0);
+        string value;
+        EXPECT_FALSE(m_fdborch->m_fdbStateTable.hget("Vlan40:7c:fe:90:12:22:ed", "port", value));
+        m_fdborch->handleSyncdFlushNotif(bv, bp, entry.mac, SAI_FDB_ENTRY_TYPE_DYNAMIC);
+        EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+        EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 0);
+    }
+
+    TEST_F(FdbOrchTest, FailedVlanFlushPreservesOrphan)
+    {
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+        auto bv = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        auto bp = m_portsOrch->m_portList[ETH0].m_bridge_port_id;
+        vector<uint8_t> mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xee};
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, mac, bp, bv);
+        FdbEntry entry;
+        entry.mac = MacAddress("7c:fe:90:12:22:ee");
+        entry.bv_id = bv;
+        m_portsOrch->m_portList[ETH0].m_bridge_port_id = SAI_NULL_OBJECT_ID;
+        m_portsOrch->saiOidToAlias.erase(bp);
+        _hook_sai_fdb_api();
+        g_sai_flush_result = SAI_STATUS_FAILURE;
+        m_fdborch->flushFDBEntries(SAI_NULL_OBJECT_ID, bv);
+        _unhook_sai_fdb_api();
+        EXPECT_FALSE(m_fdborch->m_entries.at(entry).is_flush_pending);
+        EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 1);
+        EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 1);
+        string value;
+        EXPECT_TRUE(m_fdborch->m_fdbStateTable.hget("Vlan40:7c:fe:90:12:22:ee", "port", value));
+    }
+
+    TEST_F(FdbOrchTest, TargetedFlushPreservesStaticLiveAndOtherVlanEntries)
+    {
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+        auto bv = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        auto bp = m_portsOrch->m_portList[ETH0].m_bridge_port_id;
+        const sai_object_id_t other_bv = 0x26000000000797;
+        Port other("Vlan41", Port::VLAN);
+        other.m_vlan_info.vlan_oid = other_bv;
+        other.m_vlan_info.vlan_id = 41;
+        m_portsOrch->m_portList["Vlan41"] = other;
+        m_portsOrch->saiOidToAlias[other_bv] = "Vlan41";
+        Port live("Ethernet4", Port::PHY);
+        live.m_bridge_port_id = 0x3a000000002c34;
+        m_portsOrch->m_portList["Ethernet4"] = live;
+        m_portsOrch->saiOidToAlias[live.m_bridge_port_id] = "Ethernet4";
+        vector<uint8_t> static_mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xef};
+        vector<uint8_t> live_mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xf0};
+        vector<uint8_t> other_mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xf1};
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, static_mac, bp, bv);
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, live_mac, live.m_bridge_port_id, bv);
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, other_mac, bp, other_bv);
+        FdbEntry static_entry;
+        static_entry.mac = MacAddress("7c:fe:90:12:22:ef");
+        static_entry.bv_id = bv;
+        m_fdborch->m_entries.at(static_entry).sai_fdb_type = SAI_FDB_ENTRY_TYPE_STATIC;
+        m_fdborch->m_entries.at(static_entry).type = "dynamic_control_learn";
+        m_portsOrch->m_portList[ETH0].m_bridge_port_id = SAI_NULL_OBJECT_ID;
+        m_portsOrch->saiOidToAlias.erase(bp);
+        _hook_sai_fdb_api();
+        m_fdborch->flushFDBEntries(SAI_NULL_OBJECT_ID, bv);
+        _unhook_sai_fdb_api();
+        EXPECT_EQ(m_fdborch->m_entries.size(), 3);
+        EXPECT_FALSE(m_fdborch->m_entries.at(static_entry).is_flush_pending);
+        EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 2);
+        EXPECT_EQ(m_portsOrch->m_portList["Vlan41"].m_fdb_count, 1);
+        EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 2);
+        EXPECT_EQ(m_portsOrch->m_portList["Ethernet4"].m_fdb_count, 1);
+    }
+
+    TEST_F(FdbOrchTest, OrphanFlushReconcilesRecreatedAliasAndBridgePort)
+    {
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+        auto bv = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        auto bp = m_portsOrch->m_portList[ETH0].m_bridge_port_id;
+        const sai_object_id_t new_bp = 0x3a000000002c35;
+        // A new Port starts at zero; a surviving Port retains the orphan ref.
+        for (uint32_t retained_count : {0u, 1u})
+        {
+            for (uint32_t live_count : {0u, 3u})
+            {
+                setUpPort(m_portsOrch.get());
+                setUpVlanMember(m_portsOrch.get());
+                vector<uint8_t> mac = {0x7c, 0xfe, 0x90, 0x12, 0x22, 0xf2};
+                triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, mac, bp, bv);
+                m_portsOrch->saiOidToAlias.erase(bp);
+                Port recreated(ETH0, Port::PHY);
+                recreated.m_bridge_port_id = new_bp;
+                recreated.m_fdb_count = retained_count;
+                m_portsOrch->m_portList[ETH0] = recreated;
+                m_portsOrch->saiOidToAlias[new_bp] = ETH0;
+                for (uint32_t index = 0; index < live_count; index++)
+                {
+                    vector<uint8_t> live_mac = {0x7c, 0xfe, 0x90, 0x12, 0x23, static_cast<uint8_t>(index)};
+                    triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, live_mac, new_bp, bv);
+                }
+                _hook_sai_fdb_api();
+                m_fdborch->flushFDBEntries(SAI_NULL_OBJECT_ID, bv);
+                _unhook_sai_fdb_api();
+                EXPECT_EQ(m_fdborch->m_entries.size(), live_count);
+                EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, live_count);
+                EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, live_count);
+                EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_bridge_port_id, new_bp);
+                // Drain the live entries before the next lifecycle scenario.
+                m_fdborch->handleSyncdFlushNotif(bv, new_bp, MacAddress("00:00:00:00:00:00"), SAI_FDB_ENTRY_TYPE_DYNAMIC);
+                EXPECT_TRUE(m_fdborch->m_entries.empty());
+            }
+        }
+    }
+
+    TEST_F(FdbOrchTest, DynamicFlushReconciliationRespectsEveryScope)
+    {
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+        auto bv = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        auto bp = m_portsOrch->m_portList[ETH0].m_bridge_port_id;
+        const sai_object_id_t other_bv = 0x26000000000797;
+        const sai_object_id_t other_bp = 0x3a000000002c34;
+        Port other_vlan("Vlan41", Port::VLAN);
+        other_vlan.m_vlan_info.vlan_oid = other_bv;
+        other_vlan.m_vlan_info.vlan_id = 41;
+        m_portsOrch->m_portList["Vlan41"] = other_vlan;
+        m_portsOrch->saiOidToAlias[other_bv] = "Vlan41";
+        Port other_port("Ethernet4", Port::PHY);
+        other_port.m_bridge_port_id = other_bp;
+        m_portsOrch->m_portList["Ethernet4"] = other_port;
+        const vector<pair<sai_object_id_t, sai_object_id_t>> scopes = {
+            {SAI_NULL_OBJECT_ID, SAI_NULL_OBJECT_ID}, // ALL
+            {bp, SAI_NULL_OBJECT_ID},                // PORT
+            {SAI_NULL_OBJECT_ID, bv},                // VLAN
+            {bp, bv}                                // PORT + VLAN
+        };
+        for (const auto &scope : scopes)
+        {
+            m_portsOrch->saiOidToAlias[bp] = ETH0;
+            m_portsOrch->saiOidToAlias[other_bp] = "Ethernet4";
+            for (auto vlan : {bv, other_bv})
+            {
+                for (auto bridge : {bp, other_bp})
+                {
+                    vector<uint8_t> mac = {0x7c, 0xfe, 0x90, 0x12, 0x22,
+                                          static_cast<uint8_t>(bridge == bp ? 1 : 2)};
+                    triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, mac, bridge, vlan);
+                }
+            }
+            ASSERT_EQ(m_fdborch->m_entries.size(), 4);
+            m_portsOrch->saiOidToAlias.erase(bp);
+            m_portsOrch->saiOidToAlias.erase(other_bp);
+            m_fdborch->reconcileDynamicFdbFlush(scope.first, scope.second);
+            size_t expected = scope.first == SAI_NULL_OBJECT_ID ? 2 : 1;
+            expected *= scope.second == SAI_NULL_OBJECT_ID ? 2 : 1;
+            EXPECT_EQ(m_fdborch->m_entries.size(), 4 - expected);
+            for (const auto &remaining : m_fdborch->m_entries)
+            {
+                EXPECT_TRUE((scope.first != SAI_NULL_OBJECT_ID && remaining.second.bridge_port_id != scope.first) ||
+                            (scope.second != SAI_NULL_OBJECT_ID && remaining.first.bv_id != scope.second));
+                EXPECT_FALSE(remaining.second.is_flush_pending);
+            }
+            m_fdborch->reconcileDynamicFdbFlush(SAI_NULL_OBJECT_ID, SAI_NULL_OBJECT_ID);
+            EXPECT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+            EXPECT_EQ(m_portsOrch->m_portList["Vlan41"].m_fdb_count, 0);
+            EXPECT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 0);
+            EXPECT_EQ(m_portsOrch->m_portList["Ethernet4"].m_fdb_count, 0);
+        }
     }
 
     /* Test Port Vlan Flush Request from Top to Bottom */
