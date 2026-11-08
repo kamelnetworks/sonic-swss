@@ -248,7 +248,8 @@ bool FdbOrch::storeFdbEntryState(const FdbUpdate& update)
 /*
 clears stateDb and decrements corresponding internal fdb counters
 */
-void FdbOrch::clearFdbEntry(const FdbEntry& entry, const FdbData& fdbData)
+void FdbOrch::clearFdbEntry(const FdbEntry& entry, const FdbData& fdbData,
+                            const map<string, uint32_t>* remainingPortFdbCounts)
 {
     FdbUpdate update;
     update.entry = entry;
@@ -278,8 +279,35 @@ void FdbOrch::clearFdbEntry(const FdbEntry& entry, const FdbData& fdbData)
     }
     else if (m_portsOrch->getPort(update.entry.port_name, port))
     {
-        /* bridge port may be deleted,  try to get port by port_name */
-        is_port_valid = true;
+        // The alias can survive bridge-port recreation, or belong to a new Port.
+        // Reconcile its remaining cache references instead of guessing whether
+        // the old entry is still included in the current port's counter.
+        if (remainingPortFdbCounts)
+        {
+            auto count = remainingPortFdbCounts->find(port.m_alias);
+            port.m_fdb_count = count == remainingPortFdbCounts->end() ? 0 : count->second;
+        }
+        else
+        {
+            port.m_fdb_count = 0;
+            for (const auto &remaining : m_entries)
+            {
+                Port owner;
+                if (m_portsOrch->getPortByBridgePortId(remaining.second.bridge_port_id, owner))
+                {
+                    if (owner.m_alias == port.m_alias)
+                    {
+                        port.m_fdb_count++;
+                    }
+                }
+                else if (remaining.first.port_name == port.m_alias)
+                {
+                    port.m_fdb_count++;
+                }
+            }
+        }
+        m_portsOrch->setPort(port.m_alias, port);
+        notifyTunnelOrch(port);
     }
 
     if (is_port_valid)
@@ -1334,12 +1362,9 @@ void FdbOrch::handleNotification(NotificationConsumer& consumer, const KeyOpFiel
                 SWSS_LOG_ERROR("Flush fdb failed, return code %x", status);
             }
 
-            if (status == SAI_STATUS_SUCCESS) {
-                for (map<FdbEntry, FdbData>::iterator it = m_entries.begin();
-                        it != m_entries.end(); it++)
-                {
-                    it->second.is_flush_pending = true;
-                }
+            if (status == SAI_STATUS_SUCCESS)
+            {
+                reconcileDynamicFdbFlush(SAI_NULL_OBJECT_ID, SAI_NULL_OBJECT_ID);
             }
 
             return;
@@ -1454,6 +1479,50 @@ void FdbOrch::handleNotification(NotificationConsumer& consumer, const KeyOpFiel
     }
 }
 
+// Called only after a successful dynamic-only SAI flush. Keep live bridge ports
+// notification-driven and reconcile orphan cache entries that cannot be relearned.
+void FdbOrch::reconcileDynamicFdbFlush(sai_object_id_t bridge_port_oid,
+                                       sai_object_id_t vlan_oid)
+{
+    // Count once for the batch: clearing N orphans must not scan the cache N times.
+    // Keep references for not-yet-cleared entries until their normal callbacks run.
+    map<string, uint32_t> remainingPortFdbCounts;
+    for (const auto &cached : m_entries)
+    {
+        Port owner;
+        auto alias = m_portsOrch->getPortByBridgePortId(cached.second.bridge_port_id, owner)
+                         ? owner.m_alias : cached.first.port_name;
+        remainingPortFdbCounts[alias]++;
+    }
+    for (auto it = m_entries.begin(); it != m_entries.end();)
+    {
+        auto current = it++;
+        if (current->second.sai_fdb_type != SAI_FDB_ENTRY_TYPE_DYNAMIC ||
+            (bridge_port_oid != SAI_NULL_OBJECT_ID && current->second.bridge_port_id != bridge_port_oid) ||
+            (vlan_oid != SAI_NULL_OBJECT_ID && current->first.bv_id != vlan_oid))
+        {
+            continue;
+        }
+
+        current->second.is_flush_pending = true;
+        Port port;
+        if (!m_portsOrch->getPortByBridgePortId(current->second.bridge_port_id, port))
+        {
+            // The successful dynamic flush covers this entry, but an already empty
+            // ASIC may send no notification. A deleted bridge port cannot relearn it.
+            // Copy before clearing: clearFdbEntry removes the cached entry itself.
+            auto entry = current->first;
+            auto data = current->second;
+            auto &count = remainingPortFdbCounts[entry.port_name];
+            if (count > 0)
+            {
+                count--;
+            }
+            clearFdbEntry(entry, data, &remainingPortFdbCounts);
+        }
+    }
+}
+
 /*
  * Name: flushFDBEntries
  * Params:
@@ -1473,9 +1542,6 @@ void FdbOrch::flushFDBEntries(sai_object_id_t bridge_port_oid,
     sai_attribute_t            attr;
     sai_status_t               rv = SAI_STATUS_SUCCESS;
 
-    bool bridge_port_exist = false;
-    bool vlan_exist = false;
-
     SWSS_LOG_ENTER();
 
     if (SAI_NULL_OBJECT_ID == bridge_port_oid &&
@@ -1491,7 +1557,6 @@ void FdbOrch::flushFDBEntries(sai_object_id_t bridge_port_oid,
         attr.id = SAI_FDB_FLUSH_ATTR_BRIDGE_PORT_ID;
         attr.value.oid = bridge_port_oid;
         attrs.push_back(attr);
-        bridge_port_exist = true;
     }
 
     if (SAI_NULL_OBJECT_ID != vlan_oid)
@@ -1499,7 +1564,6 @@ void FdbOrch::flushFDBEntries(sai_object_id_t bridge_port_oid,
         attr.id = SAI_FDB_FLUSH_ATTR_BV_ID;
         attr.value.oid = vlan_oid;
         attrs.push_back(attr);
-        vlan_exist = true;
     }
 
     /* do not flush static mac */
@@ -1515,16 +1579,9 @@ void FdbOrch::flushFDBEntries(sai_object_id_t bridge_port_oid,
         SWSS_LOG_ERROR("Flushing FDB failed. rv:%d", rv);
     }
 
-    if (SAI_STATUS_SUCCESS == rv) {
-        for (map<FdbEntry, FdbData>::iterator it = m_entries.begin();
-                it != m_entries.end(); it++)
-        {
-            if ((!bridge_port_exist || it->second.bridge_port_id == bridge_port_oid) &&
-                (!vlan_exist || it->first.bv_id == vlan_oid))
-            {
-                it->second.is_flush_pending = true;
-            }
-        }
+    if (SAI_STATUS_SUCCESS == rv)
+    {
+        reconcileDynamicFdbFlush(bridge_port_oid, vlan_oid);
     }
 }
 
