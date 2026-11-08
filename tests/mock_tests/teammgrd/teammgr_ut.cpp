@@ -1,6 +1,10 @@
 #include "gtest/gtest.h"
 #include "../mock_table.h"
+#define private public
+#define protected public
 #include "teammgr.h"
+#undef protected
+#undef private
 #include <dlfcn.h>
 #include <net/if.h>
 #include <netlink/addr.h>
@@ -526,4 +530,375 @@ namespace teammgr_ut
             return fvField(fv) == "system_mac" && fvValue(fv) == "02:03:04:05:06:07";
         }));
     }
+    /* Kernel master reported by "ip -o link show dev <port>" in the tests below */
+    static std::string mock_port_master;
+    /* Nonzero: "ip -o link show dev <port>" fails with this status and prints mock_link_show_err */
+    static int mock_link_show_rc = 0;
+    static std::string mock_link_show_err;
+    static int mock_remove_rc = 0;
+
+    static int cb_lag_member(const std::string &cmd, std::string &stdout)
+    {
+        if (cmd.find("/sbin/ip -o link show dev") != std::string::npos)
+        {
+            mockCallArgs.push_back(cmd);
+            if (mock_link_show_rc != 0)
+            {
+                stdout = mock_link_show_err;
+                return mock_link_show_rc;
+            }
+            stdout = "47: Ethernet0: <BROADCAST,MULTICAST> mtu 9100 qdisc noop ";
+            if (!mock_port_master.empty())
+            {
+                stdout += "master " + mock_port_master + " ";
+            }
+            stdout += "state DOWN mode DEFAULT group default qlen 1000\\    link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff\n";
+            return 0;
+        }
+        if (cmd.find("port remove") != std::string::npos && mock_remove_rc != 0)
+        {
+            mockCallArgs.push_back(cmd);
+            stdout = "teamd removal failed";
+            return mock_remove_rc;
+        }
+        return cb(cmd, stdout);
+    }
+
+    static bool commandSeen(const std::string &needle)
+    {
+        for (const auto &c : mockCallArgs)
+        {
+            if (c.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void addReadyLagAndPort(swss::DBConnector *state_db)
+    {
+        swss::Table state_lag_table(state_db, STATE_LAG_TABLE_NAME);
+        state_lag_table.set("PortChannel99", { { "state", "ok" } });
+        swss::Table state_port_table(state_db, STATE_PORT_TABLE_NAME);
+        state_port_table.set("Ethernet0", { { "state", "ok" } });
+    }
+
+    /* A port that is still a VLAN member (kernel master Bridge) is not enslaved
+     * until it leaves the bridge; the LAG member is retried, not dropped. */
+    TEST_F(TeamMgrTest, testLagMemberDeferredWhilePortIsVlanMember)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "Bridge";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 1);   /* kept for retry */
+        swss::Table app_port_table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        std::vector<swss::FieldValueTuple> fvs;
+        EXPECT_FALSE(app_port_table.get("Ethernet0", fvs));
+
+        /* Still a VLAN member on the next retry: still deferred */
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+
+        /* vlanmgrd detached the port from the bridge: the retry enslaves it */
+        mock_port_master = "";
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port add \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(app_port_table.get("Ethernet0", fvs));
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* The same deferral when the VLAN membership is only configured (CONFIG_DB
+     * VLAN_MEMBER) and vlanmgrd has not applied it to the kernel yet */
+    TEST_F(TeamMgrTest, testLagMemberDeferredWhileVlanMemberConfigured)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        swss::Table cfg_vlan_member_table(m_config_db.get(), CFG_VLAN_MEMBER_TABLE_NAME);
+        cfg_vlan_member_table.set("Vlan3999|Ethernet0", { { "tagging_mode", "untagged" } });
+        /* A VLAN member that is another port, or a port channel, doesn't count */
+        cfg_vlan_member_table.set("Vlan3999|Ethernet4", { { "tagging_mode", "untagged" } });
+        cfg_vlan_member_table.set("Vlan3999|PortChannel99", { { "tagging_mode", "tagged" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        /* The VLAN membership is removed from the config: the retry enslaves the port */
+        cfg_vlan_member_table.del("Vlan3999|Ethernet0");
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port add \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* Removing a deferred member from the config forgets it without touching teamd */
+    TEST_F(TeamMgrTest, testDeferredLagMemberRemovedFromConfig)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "Bridge";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port remove"));
+        EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* A port already enslaved by its port channel is left alone */
+    TEST_F(TeamMgrTest, testLagMemberAlreadyEnslavedIsIgnored)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "PortChannel99";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* Review of kamelnetworks/sonic-swss#2: when the port's kernel master can't be
+     * read it may still be in the bridge, so it is not enslaved on a guess; the
+     * member is retried and added once the lookup works. */
+    TEST_F(TeamMgrTest, testLagMemberDeferredWhenMasterLookupFails)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_port_master = "";
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Cannot send link get request: No buffer space available\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/sbin/ip -o link show dev"));
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 1);   /* kept for retry, not ignored */
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port add \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    /* A port that does not exist is still ignored, as before */
+    TEST_F(TeamMgrTest, testLagMemberIgnoredWhenPortDoesNotExist)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Device \"Ethernet0\" does not exist.\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        mock_link_show_rc = 0;
+        EXPECT_FALSE(commandSeen("port add"));
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+    /* A retry marker must not suppress cleanup of a pre-existing member. */
+    TEST_F(TeamMgrTest, testExistingLagMemberDeleteRetriesUnknownMaster)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+        mock_port_master = "PortChannel99";
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Cannot send link get request: No buffer space available\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        ASSERT_EQ(consumer->m_toSync.size(), 1);
+
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+        EXPECT_FALSE(commandSeen("port remove"));
+        EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port remove \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    TEST_F(TeamMgrTest, testExistingLagMemberLookupRecoveryThenDelete)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+        mock_port_master = "PortChannel99";
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Cannot send link get request: No buffer space available\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        ASSERT_EQ(consumer->m_toSync.size(), 1);
+
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+        EXPECT_FALSE(commandSeen("port add"));
+
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl \"PortChannel99\" port remove \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    TEST_F(TeamMgrTest, testAppliedLagMemberDetachedBeforeDelete)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        callback = cb_lag_member;
+        mock_port_master = "";
+        swss::Table cfg_port(m_config_db.get(), CFG_PORT_TABLE_NAME);
+        cfg_port.set("Ethernet0", { { "mtu", "1500" }, { "admin_status", "down" } });
+        swss::Table cfg_lag(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag.set("PortChannel99", { { "mtu", "9000" } });
+        ASSERT_EQ(teammgr.addLagMember("PortChannel99", "Ethernet0"), task_success);
+        swss::Table app_port(m_app_db.get(), APP_PORT_TABLE_NAME);
+        std::string mtu;
+        app_port.hget("Ethernet0", "mtu", mtu);
+        ASSERT_EQ(mtu, "9000");
+
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_FALSE(commandSeen("port remove"));
+        EXPECT_TRUE(commandSeen("link set dev \"Ethernet0\" mtu \"1500\""));
+        app_port.hget("Ethernet0", "mtu", mtu);
+        EXPECT_EQ(mtu, "1500");
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+    }
+
+    TEST_F(TeamMgrTest, testAppliedLagMemberMovedOrLostBeforeDelete)
+    {
+        // Netlink removal drives teamd/teamsyncd cleanup. A stale teamdctl
+        // remove must not detach a new owner or recreate a missing APP_PORT.
+        for (const auto &owner : { "Bridge", "PortChannel100", "missing" })
+        {
+            swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+            callback = cb_lag_member;
+            mock_port_master = "";
+            mock_link_show_rc = 0;
+            ASSERT_EQ(teammgr.addLagMember("PortChannel99", "Ethernet0"), task_success);
+            swss::Table app_port(m_app_db.get(), APP_PORT_TABLE_NAME);
+            app_port.set("Ethernet0", { { "mtu", "1600" }, { "admin_status", "down" } });
+            mock_port_master = owner;
+            if (mock_port_master == "missing")
+            {
+                mock_link_show_rc = 1;
+                mock_link_show_err = "Device \"Ethernet0\" does not exist.\n";
+                app_port.del("Ethernet0");
+            }
+            auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+            ASSERT_NE(consumer, nullptr);
+            consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+            mockCallArgs.clear();
+            teammgr.doTask();
+            mock_link_show_rc = 0;
+            EXPECT_FALSE(commandSeen("port remove"));
+            EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+            EXPECT_EQ(consumer->m_toSync.size(), 0);
+            EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+            std::string mtu;
+            bool exists = app_port.hget("Ethernet0", "mtu", mtu);
+            EXPECT_EQ(exists, mock_port_master != "missing");
+            if (exists)
+            {
+                EXPECT_EQ(mtu, "1600");
+            }
+        }
+    }
+
+    TEST_F(TeamMgrTest, testLagMemberRemovalFailureRetried)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        callback = cb_lag_member;
+        mock_port_master = "PortChannel99";
+        mock_remove_rc = 1;
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+        EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+        mock_remove_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("port remove"));
+        EXPECT_TRUE(commandSeen("link set dev \"Ethernet0\""));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+    }
+
 }

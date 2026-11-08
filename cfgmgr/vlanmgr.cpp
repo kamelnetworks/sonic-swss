@@ -12,7 +12,6 @@
 using namespace std;
 using namespace swss;
 
-#define DOT1Q_BRIDGE_NAME   "Bridge"
 #define VLAN_PREFIX         "Vlan"
 #define LAG_PREFIX          "PortChannel"
 #define DEFAULT_VLAN_ID     "1"
@@ -26,6 +25,7 @@ VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
         Orch(cfgDb, stateDb, tableNames, stateTableNames),
         m_cfgVlanTable(cfgDb, CFG_VLAN_TABLE_NAME),
         m_cfgVlanMemberTable(cfgDb, CFG_VLAN_MEMBER_TABLE_NAME),
+        m_cfgLagMemberTable(cfgDb, CFG_LAG_MEMBER_TABLE_NAME),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
         m_stateLagTable(stateDb, STATE_LAG_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
@@ -303,9 +303,59 @@ bool VlanMgr::removeHostVlanMember(int vlan_id, const string &port_alias)
     cmds << BASH_CMD " -c " << shellquote(inner.str());
 
     std::string res;
-    EXEC_WITH_ERROR_THROW(cmds.str(), res);
+    try
+    {
+        EXEC_WITH_ERROR_THROW(cmds.str(), res);
+    }
+    catch (const std::runtime_error& e)
+    {
+        /*
+         * "bridge vlan del" fails with "Operation not supported" when the
+         * port is no longer attached to the bridge, e.g. because a port
+         * channel enslaved it in the meantime. The kernel VLAN membership is
+         * already gone then, so finish the removal instead of retrying the
+         * command forever. Only do so when the kernel confirms it (the port
+         * is gone, or its master is not the bridge): if the master can't be
+         * read, the membership may still be there, so keep retrying.
+         */
+        string master;
+        auto lookup = getNetdevMaster(port_alias, master);
+        if (lookup == NetdevMasterLookup::NO_DEVICE ||
+            (lookup == NetdevMasterLookup::FOUND && master != DOT1Q_BRIDGE_NAME))
+        {
+            string state = lookup == NetdevMasterLookup::NO_DEVICE ? "no such device" : "kernel master: '" + master + "'";
+            SWSS_LOG_WARN("Port %s is not attached to %s (%s), treating its Vlan%d membership as already removed from the kernel: %s",
+                          port_alias.c_str(), DOT1Q_BRIDGE_NAME, state.c_str(), vlan_id, e.what());
+            return true;
+        }
+        if (lookup == NetdevMasterLookup::FAILED)
+        {
+            SWSS_LOG_WARN("Unable to look up the kernel master of port %s, retrying the Vlan%d member removal",
+                          port_alias.c_str(), vlan_id);
+        }
+        throw;
+    }
 
     return true;
+}
+
+/* Is the port configured as a port channel member (CONFIG_DB PORTCHANNEL_MEMBER)? */
+bool VlanMgr::isConfiguredLagMember(const string &port_alias, string &lag_alias)
+{
+    vector<string> keys;
+    m_cfgLagMemberTable.getKeys(keys);
+
+    for (auto key: keys)
+    {
+        auto tokens = tokenize(key, config_db_key_delimiter);
+        if (tokens.size() == 2 && tokens[1] == port_alias)
+        {
+            lag_alias = tokens[0];
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool VlanMgr::isVlanMacOk()
@@ -664,6 +714,51 @@ void VlanMgr::doVlanMemberTask(Consumer &consumer)
                 continue;
             }
 
+            /*
+             * A port that is a port channel member (configured in
+             * PORTCHANNEL_MEMBER, or whose kernel master is a port channel)
+             * can't be a VLAN member too: "ip link set master Bridge" would
+             * silently steal it from the team and leave the kernel and the
+             * ASIC disagreeing (the CLI rejects this combination). Defer the
+             * VLAN membership until the port leaves the port channel; the
+             * retry happens on every select timeout. The config check makes
+             * the outcome deterministic when both memberships are written at
+             * once, the kernel check covers a membership teammgrd applied
+             * before the config was visible here.
+             */
+            if (port_alias.compare(0, strlen(LAG_PREFIX), LAG_PREFIX) != 0)
+            {
+                string lag_alias, master, reason;
+                if (isConfiguredLagMember(port_alias, lag_alias))
+                {
+                    reason = "it is configured in PORTCHANNEL_MEMBER|" + lag_alias;
+                }
+                else
+                {
+                    auto lookup = getNetdevMaster(port_alias, master);
+                    if (lookup == NetdevMasterLookup::FOUND &&
+                        !master.empty() && master != DOT1Q_BRIDGE_NAME)
+                    {
+                        reason = "its kernel master is " + master;
+                    }
+                    else if (lookup == NetdevMasterLookup::FAILED)
+                    {
+                        /* It may still be enslaved by a port channel: don't steal it on a guess */
+                        reason = "its kernel master could not be looked up";
+                    }
+                }
+                if (!reason.empty())
+                {
+                    if (m_deferredVlanMembers.insert(kfvKey(t)).second)
+                    {
+                        SWSS_LOG_WARN("Deferring VLAN member %s because %s, until the port is out of any port channel",
+                                      kfvKey(t).c_str(), reason.c_str());
+                    }
+                    it++;
+                    continue;
+                }
+            }
+
             if (addHostVlanMember(vlan_id, port_alias, tagging_mode))
             {
                 key = VLAN_PREFIX + to_string(vlan_id);
@@ -678,6 +773,10 @@ void VlanMgr::doVlanMemberTask(Consumer &consumer)
 
                 m_vlanMemberReplay.erase(kfvKey(t));
                 m_PortVlanMember[port_alias][vlan_alias] = tagging_mode;
+                if (m_deferredVlanMembers.erase(kfvKey(t)))
+                {
+                    SWSS_LOG_NOTICE("Added the deferred VLAN member %s", kfvKey(t).c_str());
+                }
             }
             else
             {
@@ -688,6 +787,10 @@ void VlanMgr::doVlanMemberTask(Consumer &consumer)
         }
         else if (op == DEL_COMMAND)
         {
+            if (m_deferredVlanMembers.erase(kfvKey(t)))
+            {
+                SWSS_LOG_NOTICE("Deferred VLAN member %s was removed from the config", kfvKey(t).c_str());
+            }
             if (isVlanMemberStateOk(kfvKey(t)))
             {
                 removeHostVlanMember(vlan_id, port_alias);
