@@ -742,4 +742,68 @@ namespace teammgr_ut
         EXPECT_EQ(consumer->m_toSync.size(), 0);
         EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
     }
+    /* A retry marker must not suppress cleanup of a pre-existing member. */
+    TEST_F(TeamMgrTest, testExistingLagMemberDeleteRetriesUnknownMaster)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+        mock_port_master = "PortChannel99";
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Cannot send link get request: No buffer space available\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        ASSERT_EQ(consumer->m_toSync.size(), 1);
+
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_EQ(consumer->m_toSync.size(), 1);
+        EXPECT_FALSE(commandSeen("port remove"));
+        EXPECT_FALSE(commandSeen("link set dev \"Ethernet0\""));
+        EXPECT_EQ(teammgr.m_deferredLagMembers.count("Ethernet0"), 1);
+
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl PortChannel99 port remove Ethernet0"));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
+    TEST_F(TeamMgrTest, testExistingLagMemberLookupRecoveryThenDelete)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        addReadyLagAndPort(m_state_db.get());
+        swss::Table cfg_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+        cfg_lag_member_table.set("PortChannel99|Ethernet0", { { "NULL", "NULL" } });
+        callback = cb_lag_member;
+        mock_port_master = "PortChannel99";
+        mock_link_show_rc = 1;
+        mock_link_show_err = "Cannot send link get request: No buffer space available\n";
+        teammgr.addExistingData(&cfg_lag_member_table);
+        teammgr.doTask();
+        auto consumer = dynamic_cast<Consumer *>(teammgr.getExecutor(CFG_LAG_MEMBER_TABLE_NAME));
+        ASSERT_NE(consumer, nullptr);
+        ASSERT_EQ(consumer->m_toSync.size(), 1);
+
+        mock_link_show_rc = 0;
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+        EXPECT_FALSE(commandSeen("port add"));
+
+        consumer->addToSync(swss::KeyOpFieldsValuesTuple{ "PortChannel99|Ethernet0", DEL_COMMAND, {} });
+        mockCallArgs.clear();
+        teammgr.doTask();
+        EXPECT_TRUE(commandSeen("/usr/bin/teamdctl PortChannel99 port remove Ethernet0"));
+        EXPECT_EQ(consumer->m_toSync.size(), 0);
+        EXPECT_TRUE(teammgr.m_deferredLagMembers.empty());
+    }
+
 }

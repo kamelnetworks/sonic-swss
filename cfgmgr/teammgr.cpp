@@ -390,16 +390,32 @@ void TeamMgr::doLagMemberTask(Consumer &consumer)
         }
         else if (op == DEL_COMMAND)
         {
-            if (m_deferredLagMembers.erase(member))
+            // Deferral only records a retry/logging state. It cannot prove
+            // that a repeated SET or replay never enslaved this member.
+            string master;
+            auto lookup = getNetdevMaster(member, master);
+            if (lookup == NetdevMasterLookup::FAILED)
             {
-                /* Never enslaved: nothing to undo in the kernel */
-                SWSS_LOG_NOTICE("Deferred member %s of port channel %s was removed from the config",
-                                member.c_str(), lag.c_str());
+                if (m_deferredLagMembers.insert(member).second)
+                {
+                    SWSS_LOG_WARN("Unable to look up the kernel master of port %s, deferring removal from port channel %s",
+                                  member.c_str(), lag.c_str());
+                }
+                it++;
+                continue;
             }
-            else
+            if (lookup == NetdevMasterLookup::FOUND && master == lag)
             {
                 removeLagMember(lag, member);
             }
+            else
+            {
+                // Never applied, already removed, or now owned elsewhere:
+                // don't reset attributes on another daemon's port.
+                SWSS_LOG_NOTICE("Port %s is not attached to port channel %s, skipping kernel removal",
+                                member.c_str(), lag.c_str());
+            }
+            m_deferredLagMembers.erase(member);
         }
 
         it = consumer.m_toSync.erase(it);
@@ -909,6 +925,7 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
     // If port is already enslaved by this port channel, ignore this operation
     if (master == lag)
     {
+        m_deferredLagMembers.erase(member);
         return task_ignore;
     }
 
