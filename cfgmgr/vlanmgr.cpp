@@ -16,7 +16,9 @@ using namespace swss;
 #define VLAN_PREFIX         "Vlan"
 #define LAG_PREFIX          "PortChannel"
 #define DEFAULT_VLAN_ID     "1"
-#define DEFAULT_MTU_STR     "9100"
+/* The Bridge's mtu, which is also the largest mtu the kernel accepts for a host VLAN */
+#define BRIDGE_MTU          9100
+#define DEFAULT_MTU_STR     std::to_string(BRIDGE_MTU)
 #define VLAN_HLEN            4
 
 extern MacAddress gMacAddress;
@@ -192,7 +194,6 @@ bool VlanMgr::setHostVlanMtu(int vlan_id, uint32_t mtu)
         return true;
     }
 
-    /* The kernel refuses an mtu larger than the Bridge's (ERANGE) */
     SWSS_LOG_ERROR("Failed to set %s%d mtu %u, cmd: %s, rc: %d, error: %s",
                    VLAN_PREFIX, vlan_id, mtu, cmds.c_str(), ret, res.c_str());
     return false;
@@ -440,6 +441,15 @@ void VlanMgr::doVlanTask(Consumer &consumer)
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
+            /* The kernel refuses (ERANGE) an mtu above the Bridge's. Reject it
+             * here too, so that APPL_DB and the ASIC don't get it either. */
+            if (mtu_value > BRIDGE_MTU)
+            {
+                SWSS_LOG_ERROR("%s: mtu %u is above the maximum %d, discarding VLAN update",
+                               key.c_str(), mtu_value, BRIDGE_MTU);
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
 
             /*
              * If state is already set for this vlan, but it doesn't exist in m_vlans set,
@@ -462,6 +472,8 @@ void VlanMgr::doVlanTask(Consumer &consumer)
             if (m_vlans.find(key) == m_vlans.end())
             {
                 addHostVlan(vlan_id);
+                /* Not again when the mtu below is retried */
+                m_vlans.insert(key);
             }
             m_vlanReplay.erase(kfvKey(t));
 
@@ -496,10 +508,16 @@ void VlanMgr::doVlanTask(Consumer &consumer)
             /*
              * Set the host VLAN mtu, on creation and on every change. The
              * VLAN netdev sits on the Bridge, whose mtu is fixed at
-             * DEFAULT_MTU_STR, so its members don't cap it. Without an mtu
+             * BRIDGE_MTU, so its members don't cap it. Without an mtu
              * field the VLAN goes back to the default, as in APPL_DB below.
+             * If it fails, keep the update and retry it on the next pass, and
+             * don't publish it, so that APPL_DB keeps the kernel's mtu.
              */
-            setHostVlanMtu(vlan_id, mtu_value);
+            if (!setHostVlanMtu(vlan_id, mtu_value))
+            {
+                it++;
+                continue;
+            }
 
             /* fvVector should not be empty */
             if (fvVector.empty())
@@ -518,7 +536,6 @@ void VlanMgr::doVlanTask(Consumer &consumer)
             fvVector.push_back(hostif_name_fvt);
 
             m_appVlanTableProducer.set(key, fvVector);
-            m_vlans.insert(key);
 
             fvVector.clear();
             FieldValueTuple s("state", "ok");
