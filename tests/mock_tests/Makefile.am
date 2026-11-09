@@ -323,6 +323,7 @@ tests_teammgrd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -ldl -lhiredis \
 ## vlanmgrd unit tests
 
 tests_vlanmgrd_SOURCES = vlanmgrd/vlanmgr_ut.cpp \
+                         vlanmgrd/vlanmgr_mtu_ut.cpp \
                          $(top_srcdir)/cfgmgr/vlanmgr.cpp \
                          $(top_srcdir)/lib/recorder.cpp \
                          $(top_srcdir)/orchagent/orch.cpp \
