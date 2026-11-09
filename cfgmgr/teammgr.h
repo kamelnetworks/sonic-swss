@@ -26,6 +26,7 @@ private:
     Table m_cfgPortTable;
     Table m_cfgLagTable;
     Table m_cfgLagMemberTable;
+    Table m_cfgVlanMemberTable;
     Table m_statePortTable;
     Table m_stateLagTable;
     Table m_stateMACsecIngressSATable;
@@ -34,6 +35,8 @@ private:
     ProducerStateTable m_appLagTable;
 
     std::set<std::string> m_lagList;
+    /* Members whose add is deferred because the port is still a VLAN member */
+    std::set<std::string> m_deferredLagMembers;
 
     MacAddress m_mac;
 
@@ -46,6 +49,7 @@ private:
     bool removeLag(const std::string &alias);
     task_process_status addLagMember(const std::string &lag, const std::string &member);
     bool removeLagMember(const std::string &lag, const std::string &member);
+    bool restoreLagMemberAttributes(const std::string &member);
 
     bool setLagAdminStatus(const std::string &alias, const std::string &admin_status);
     bool setLagMtu(const std::string &alias, const std::string &mtu);
@@ -53,8 +57,8 @@ private:
     bool setLagTpid(const std::string &alias, const std::string &tpid);
     int update_kernel(const std::string &alias, const std::string &system_mac);
 
-    bool isPortEnslaved(const std::string &);
     bool findPortMaster(std::string &, const std::string &);
+    bool isConfiguredVlanMember(const std::string &);
     bool checkPortIffUp(const std::string &);
     bool isPortStateOk(const std::string&);
     bool isLagStateOk(const std::string&);

@@ -21,6 +21,7 @@
 #undef private
 
 #include <sstream>
+#include <thread>
 
 // Add operator<< for vector<uint32_t> to support boost::variant printing in tests for SerdesValue
 namespace std {
@@ -2539,6 +2540,326 @@ namespace portsorch_test
         ASSERT_TRUE(countersQueueNameMap.hget("", portName + ":" + to_string(testQueueIdx), dummy));
         // Port-map should contain queue OID -> port OID mapping as a field
         ASSERT_TRUE(countersQueuePortMap.hget("", sai_serialize_object_id(readdedQ1), dummy));
+    }
+
+    /*
+     * Emulates the Broadcom TD3 SAI: removing the port that holds the first lane
+     * of a port macro tears down the whole macro, so removing any other port of
+     * that macro afterwards fails with SAI_STATUS_INVALID_PORT_NUMBER.
+     */
+    std::set<sai_object_id_t> _ut_macro_ports;
+    sai_object_id_t _ut_macro_base_port = SAI_NULL_OBJECT_ID;
+    bool _ut_macro_torn_down = false;
+    std::vector<sai_object_id_t> _ut_removed_ports;
+
+    sai_status_t _ut_stub_sai_remove_port_macro(sai_object_id_t port_id)
+    {
+        if (_ut_macro_ports.count(port_id))
+        {
+            if (_ut_macro_torn_down)
+            {
+                return SAI_STATUS_INVALID_PORT_NUMBER;
+            }
+
+            _ut_macro_ports.erase(port_id);
+            if (port_id == _ut_macro_base_port && !_ut_macro_ports.empty())
+            {
+                _ut_macro_torn_down = true;
+            }
+        }
+
+        auto status = pold_sai_port_api->remove_port(port_id);
+        if (status == SAI_STATUS_SUCCESS)
+        {
+            _ut_removed_ports.push_back(port_id);
+        }
+
+        return status;
+    }
+
+    /*
+     * DPB on TD3 (kamelnetworks/sonic-buildimage#170): breaks the default
+     * Ethernet0 out into four single-lane ports of one front-panel port
+     * (same index), as `config interface breakout` writes them. Their keys sort
+     * base port first, as the CLI's Ethernet0..Ethernet3 do. Arms the macro stub.
+     */
+    void setupBreakoutChildren(Consumer *consumer, Table &portTable,
+                               const map<string, vector<FieldValueTuple>> &ports,
+                               const vector<string> &children, map<sai_object_id_t, string> &oidToAlias)
+    {
+        std::deque<KeyOpFieldsValuesTuple> entries;
+
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { "lanes", "0" } });
+        gPortsOrch->addExistingData(&portTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        string parentLanes;
+        for (const auto &fv : ports.at("Ethernet0"))
+        {
+            if (fvField(fv) == "lanes")
+            {
+                parentLanes = fvValue(fv);
+            }
+        }
+        vector<string> lanes = tokenize(parentLanes, ',');
+        ASSERT_EQ(lanes.size(), children.size());
+
+        entries.push_back({ "Ethernet0", DEL_COMMAND, { } });
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        entries.clear();
+
+        for (size_t i = 0; i < children.size(); i++)
+        {
+            entries.push_back({ children[i], SET_COMMAND, {
+                { "lanes", lanes[i] },
+                { "index", "1" },
+                { "speed", "1000" },
+                { "mtu", "6000" },
+                { "admin_status", "up" }
+            } });
+        }
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        entries.clear();
+
+        _ut_macro_ports.clear();
+        for (const auto &alias : children)
+        {
+            Port p;
+            ASSERT_TRUE(gPortsOrch->getPort(alias, p)) << alias;
+            ASSERT_NE(p.m_port_id, SAI_NULL_OBJECT_ID);
+            _ut_macro_ports.insert(p.m_port_id);
+            oidToAlias[p.m_port_id] = alias;
+        }
+        Port base;
+        ASSERT_TRUE(gPortsOrch->getPort(children.front(), base));
+        _ut_macro_base_port = base.m_port_id;
+        _ut_macro_torn_down = false;
+        _ut_removed_ports.clear();
+    }
+
+    void deletePorts(Consumer *consumer, const vector<string> &aliases)
+    {
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        for (const auto &alias : aliases)
+        {
+            entries.push_back({ alias, DEL_COMMAND, { } });
+        }
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+    }
+
+    // The SAI switch is shared by the test suite: put the default Ethernet0 back.
+    void restoreDefaultEthernet0(Consumer *consumer, const vector<string> &children,
+                                 const map<string, vector<FieldValueTuple>> &ports)
+    {
+        _ut_macro_ports.clear();
+        _ut_macro_base_port = SAI_NULL_OBJECT_ID;
+
+        deletePorts(consumer, children);
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({ "Ethernet0", SET_COMMAND, ports.at("Ethernet0") });
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        Port p;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
+    }
+
+    /*
+     * The CLI deletes all children at once, but PortsOrch may get the base
+     * port's DEL on its own before the others. Either way the child holding the
+     * macro's first lane must go last, or the SAI tears the macro down under the
+     * other children and their DEL is retried forever.
+     */
+    TEST_F(PortsOrchTest, PortBreakoutChildrenRemovedHighestLaneFirst)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        auto consumer = dynamic_cast<Consumer *>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        const vector<string> children = { "Ethernet100", "Ethernet101", "Ethernet102", "Ethernet103" };
+        map<sai_object_id_t, string> oidToAlias;
+
+        ASSERT_NO_FATAL_FAILURE(setupBreakoutChildren(consumer, portTable, defaultPortList, children, oidToAlias));
+
+        _hook_sai_port_api();
+        ut_sai_port_api.remove_port = _ut_stub_sai_remove_port_macro;
+
+        // All children in one batch.
+        deletePorts(consumer, children);
+
+        vector<string> removed;
+        for (const auto &oid : _ut_removed_ports)
+        {
+            removed.push_back(oidToAlias[oid]);
+        }
+        const vector<string> expected = { "Ethernet103", "Ethernet102", "Ethernet101", "Ethernet100" };
+        EXPECT_EQ(removed, expected);
+        EXPECT_FALSE(_ut_macro_torn_down);
+
+        for (const auto &alias : children)
+        {
+            Port p;
+            EXPECT_FALSE(gPortsOrch->getPort(alias, p)) << alias << " was not removed";
+        }
+
+        // Re-create them, then send the base port's DEL on its own first.
+        _unhook_sai_port_api();
+        oidToAlias.clear();
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        string parentLanes;
+        for (const auto &fv : defaultPortList.at("Ethernet0"))
+        {
+            if (fvField(fv) == "lanes")
+            {
+                parentLanes = fvValue(fv);
+            }
+        }
+        vector<string> lanes = tokenize(parentLanes, ',');
+        for (size_t i = 0; i < children.size(); i++)
+        {
+            entries.push_back({ children[i], SET_COMMAND, {
+                { "lanes", lanes[i] }, { "index", "1" }, { "speed", "1000" }, { "mtu", "6000" }, { "admin_status", "up" }
+            } });
+        }
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        _ut_macro_ports.clear();
+        for (const auto &alias : children)
+        {
+            Port p;
+            ASSERT_TRUE(gPortsOrch->getPort(alias, p)) << alias;
+            _ut_macro_ports.insert(p.m_port_id);
+            oidToAlias[p.m_port_id] = alias;
+        }
+        Port base;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet100", base));
+        _ut_macro_base_port = base.m_port_id;
+        _ut_macro_torn_down = false;
+        _ut_removed_ports.clear();
+
+        _hook_sai_port_api();
+        ut_sai_port_api.remove_port = _ut_stub_sai_remove_port_macro;
+
+        deletePorts(consumer, { "Ethernet100" });
+        EXPECT_TRUE(_ut_removed_ports.empty()) << "base port removed before its siblings";
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", base));
+
+        deletePorts(consumer, { "Ethernet101", "Ethernet102", "Ethernet103" });
+
+        _unhook_sai_port_api();
+
+        removed.clear();
+        for (const auto &oid : _ut_removed_ports)
+        {
+            removed.push_back(oidToAlias[oid]);
+        }
+        EXPECT_EQ(removed, expected);
+        EXPECT_FALSE(_ut_macro_torn_down);
+
+        // No DEL of a child port is left pending (retried).
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        for (const auto &task : taskList)
+        {
+            EXPECT_EQ(task.find("Ethernet10"), std::string::npos) << task;
+        }
+
+        restoreDefaultEthernet0(consumer, children, defaultPortList);
+    }
+
+    /*
+     * Waiting never makes it safe to remove the base port under its siblings.
+     * Its DEL on its own stays pending past the old grace period (setting the
+     * port again cancels it), and so do lower siblings while a higher one's DEL
+     * is blocked by a reference (as a router interface holds it). Once that
+     * reference goes, the whole group is removed highest lane first.
+     */
+    TEST_F(PortsOrchTest, PortBreakoutBaseNeverRemovedBeforeSiblings)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        auto consumer = dynamic_cast<Consumer *>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        const vector<string> children = { "Ethernet100", "Ethernet101", "Ethernet102", "Ethernet103" };
+        map<sai_object_id_t, string> oidToAlias;
+
+        ASSERT_NO_FATAL_FAILURE(setupBreakoutChildren(consumer, portTable, defaultPortList, children, oidToAlias));
+
+        _hook_sai_port_api();
+        ut_sai_port_api.remove_port = _ut_stub_sai_remove_port_macro;
+        const auto reportAfter = gPortsOrch->m_portRemovalSiblingReportAfter;
+        gPortsOrch->m_portRemovalSiblingReportAfter = std::chrono::milliseconds(200);
+
+        Port p;
+        deletePorts(consumer, { "Ethernet100" });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", p)) << "base port removed while its siblings exist";
+        EXPECT_TRUE(_ut_removed_ports.empty());
+        EXPECT_FALSE(_ut_macro_torn_down);
+        EXPECT_TRUE(gPortsOrch->m_portRemovalDeferred.at("Ethernet100").reported);
+
+        // Setting the base port again with its lanes cancels its pending DEL.
+        string parentLanes;
+        for (const auto &fv : defaultPortList.at("Ethernet0"))
+        {
+            if (fvField(fv) == "lanes")
+            {
+                parentLanes = fvValue(fv);
+            }
+        }
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({ "Ethernet100", SET_COMMAND, {
+            { "lanes", tokenize(parentLanes, ',')[0] }, { "index", "1" }, { "speed", "1000" }, { "mtu", "6000" }, { "admin_status", "up" }
+        } });
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet100", p));
+        EXPECT_EQ(gPortsOrch->m_portRemovalDeferred.count("Ethernet100"), 0u);
+        EXPECT_EQ(consumer->m_toSync.count("Ethernet100"), 0u);
+        EXPECT_TRUE(_ut_removed_ports.empty());
+
+        // The whole group, with Ethernet102 held by a reference.
+        gPortsOrch->increasePortRefCount("Ethernet102");
+        deletePorts(consumer, children);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        for (const auto &alias : { "Ethernet100", "Ethernet101", "Ethernet102" })
+        {
+            EXPECT_TRUE(gPortsOrch->getPort(alias, p)) << alias << " removed while Ethernet102 is held";
+        }
+        EXPECT_FALSE(gPortsOrch->getPort("Ethernet103", p));
+        EXPECT_FALSE(_ut_macro_torn_down);
+
+        gPortsOrch->decreasePortRefCount("Ethernet102");
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        _unhook_sai_port_api();
+        gPortsOrch->m_portRemovalSiblingReportAfter = reportAfter;
+
+        vector<string> removed;
+        for (const auto &oid : _ut_removed_ports)
+        {
+            removed.push_back(oidToAlias[oid]);
+        }
+        const vector<string> expected = { "Ethernet103", "Ethernet102", "Ethernet101", "Ethernet100" };
+        EXPECT_EQ(removed, expected);
+        EXPECT_FALSE(_ut_macro_torn_down);
+        EXPECT_TRUE(gPortsOrch->m_portRemovalDeferred.empty());
+
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        for (const auto &task : taskList)
+        {
+            EXPECT_EQ(task.find("Ethernet10"), std::string::npos) << task;
+        }
+
+        restoreDefaultEthernet0(consumer, children, defaultPortList);
     }
 
     TEST_F(PortsOrchTest, PortPTConfigDefaultTimestampTemplate)

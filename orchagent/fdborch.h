@@ -151,6 +151,8 @@ public:
     MacMoveGuard* getMacMoveGuard() { return m_macMoveGuard.get(); }
 
 private:
+    void reconcileDynamicFdbFlush(sai_object_id_t bridge_port_oid, sai_object_id_t vlan_oid);
+
     PortsOrch *m_portsOrch;
     map<FdbEntry, FdbData> m_entries;
     fdb_entries_by_port_t m_entries_by_port;
@@ -184,7 +186,8 @@ private:
     bool storeFdbEntryState(const FdbUpdate& update);
     void notifyTunnelOrch(Port& port);
 
-    void clearFdbEntry(const FdbEntry&, const FdbData&);
+    void clearFdbEntry(const FdbEntry&, const FdbData&,
+                       const map<string, uint32_t>* remainingPortFdbCounts = nullptr);
     void handleSyncdFlushNotif(const sai_object_id_t&, const sai_object_id_t&, const MacAddress&,
                                const sai_fdb_entry_type_t&);
 

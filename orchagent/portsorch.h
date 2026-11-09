@@ -2,6 +2,7 @@
 #define SWSS_PORTSORCH_H
 
 #include <map>
+#include <chrono>
 #include <unordered_set>
 
 #include "acltable.h"
@@ -395,6 +396,8 @@ private:
     map<string, Port> m_portList;
     map<string, Port> m_pluggedModulesPort;
     map<string, vlan_members_t> m_portVlanMember;
+    /* LAG members whose add is deferred because the port is still a VLAN member */
+    set<string> m_deferredLagMembers;
     map<string, std::vector<sai_object_id_t>> m_port_voq_ids;
     /* mapping from SAI object ID to Name for faster
      * retrieval of Port/VLAN from object ID for events
@@ -440,6 +443,19 @@ private:
 
     void removePortFromLanesMap(string alias);
     void removePortFromPortListMap(sai_object_id_t port_id);
+    bool getPortLanes(sai_object_id_t port_id, set<uint32_t> &lanes) const;
+    bool getHigherLaneSibling(const string &alias, string &sibling) const;
+    bool isPortLanesUnchanged(sai_object_id_t port_id, const vector<FieldValueTuple> &fvs) const;
+
+    /* Breakout siblings: removal of a port waits for them, see getHigherLaneSibling() */
+    struct PortRemovalDeferral
+    {
+        std::chrono::steady_clock::time_point since;
+        bool reported;
+    };
+    map<string, PortRemovalDeferral> m_portRemovalDeferred;
+    /* A removal deferred this long is logged as an error; it is still never forced */
+    std::chrono::milliseconds m_portRemovalSiblingReportAfter = std::chrono::milliseconds(5000);
     void removeDefaultVlanMembers();
     void removeDefaultBridgePorts();
 
