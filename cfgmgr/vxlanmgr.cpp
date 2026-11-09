@@ -39,6 +39,16 @@ extern MacAddress gMacAddress;
 #define DST_IP "dst_ip"
 #define SOURCE_VTEP "source_vtep"
 
+/*
+ * The MTU of the kernel VXLAN netdevs: the Bridge's MTU (vlanmgrd's DEFAULT_MTU_STR), which is
+ * also the largest MTU a VlanN SVI can have. This mirrors Arista EOS, whose Vxlan1 interface has
+ * no MTU of its own and sizes nothing from the underlay: the only limit on SVI traffic is the
+ * SVI's own MTU, which vlanmgrd applies to the kernel VlanN. A netdev smaller than its SVI would
+ * make the bridge drop the difference silently; at this size an encapsulated packet too big for
+ * the underlay reaches the kernel's VXLAN PMTU discovery instead and fails at the sender.
+ */
+#define VXLAN_NETDEV_MTU "9100"
+
 static std::string getVxlanName(const swss::VxlanMgr::VxlanInfo & info)
 {
     return std::string("") + VXLAN_NAME_PREFIX + info.m_vni;
@@ -70,6 +80,8 @@ static bool areValidVxlanTunnelAddresses(const std::string &srcIp, const std::st
 // Commands
 
 #define RET_SUCCESS 0
+// createVxlanNetdevice(): the device exists (warm reconcile) but its MTU could not be set
+#define RET_MTU_NOT_SET 2
 #define RET_FAILURE 1
 
 static int cmdCreateVxlan(const swss::VxlanMgr::VxlanInfo & info, std::string & res)
@@ -629,7 +641,12 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
 
     createAppDBTunnelMapTable(t);
     ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id);
-    if (ret != RET_SUCCESS)
+    if (ret == RET_MTU_NOT_SET)
+    {
+        SWSS_LOG_WARN("Failed to set MTU %s on reconciled VxlanNetDevice %s-%s, retrying",
+                      VXLAN_NETDEV_MTU, vxlanTunnelName.c_str(), vlan_id.c_str());
+    }
+    else if (ret != RET_SUCCESS)
     {
         SWSS_LOG_WARN("Vxlan Net Dev creation failure for %s VNI(%s) VLAN(%s)",
                        vxlanTunnelName.c_str(), vni_id.c_str(), vlan_id.c_str());
@@ -642,11 +659,18 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
     map_entry.vxlan_dev_name = vxlan_dev_name;
     map_entry.vlan = vlan;
     map_entry.vni_id = vni_id;
+    // An empty mtu means "not applied": syncNetdevMtus() sets it on the next doTask()
+    map_entry.mtu = (ret == RET_MTU_NOT_SET) ? "" : VXLAN_NETDEV_MTU;
 
     m_vxlanTunnelMapCache[vxlanTunnelMapName] = map_entry;
     m_vlanMapCache[vlan] = vni_id;
     m_vniMapCache[vni_id] = vlan;
     m_vxlanTunnelCache[vxlanTunnelName].vlan_vni_refcnt++;
+
+    if (ret == RET_MTU_NOT_SET)
+    {
+        m_netdevMtuPending = true;
+    }
 
     //Inform the Vlan Mgr to update the tunnel flags if Arp/Nd Suppression is set.
     std::string key = "Vlan" + std::string(vlan_id);
@@ -1030,7 +1054,13 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
             m_vxlanNetDevices.erase(it);
             SWSS_LOG_INFO("Reconcile VxlanNetDevice %s reconciled. Pending %zu",
                             vxlan_dev_name.c_str(), m_vxlanNetDevices.size());
-            return 0;
+            // The device survived a warm restart; make sure it carries the netdev MTU (it may
+            // have been created by an image that left it at the kernel default).
+            if (setVxlanNetdeviceMtu(vxlan_dev_name, VXLAN_NETDEV_MTU) != RET_SUCCESS)
+            {
+                return RET_MTU_NOT_SET;
+            }
+            return RET_SUCCESS;
         }
         else
         {
@@ -1051,16 +1081,20 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
         evpn_nvo = true;
     }
 
-    // ip link add <vxlan_dev_name> type vxlan id <vni> local <src_ip> remote <dst_ip>
-    // dstport 4789
+    // ip link add <vxlan_dev_name> address <mac> mtu <mtu> type vxlan id <vni> local <src_ip>
+    // remote <dst_ip> nolearning dstport 4789
     // ip link set <vxlan_dev_name> master DOT1Q_BRIDGE_NAME
     // bridge vlan add vid <vlan_id> dev <vxlan_dev_name>
     // bridge vlan add vid <vlan_id> untagged pvid dev <vxlan_dev_name>
     // bridge link set dev <vxlan_dev_name> learning off
     // ip link set <vxlan_dev_name> up
 
+    // Without an explicit mtu the kernel gives the VXLAN netdev 1500 while the Bridge and
+    // the VlanN interfaces carry up to 9100; the bridge then drops every CPU-terminated
+    // overlay frame above 1500 bytes at this port.
     link_add_cmd = std::string("") + IP_CMD + " link add " + vxlan_dev_name +
-                   " address " + gMacAddress.to_string() + " type vxlan id " +
+                   " address " + gMacAddress.to_string() +
+                   " mtu " + VXLAN_NETDEV_MTU + " type vxlan id " +
                    std::string(vni_id) + " local " + src_ip +
                    ((dst_ip  == "")? "":(" remote " + dst_ip)) +
                    " nolearning " + " dstport 4789";
@@ -1125,6 +1159,56 @@ int VxlanMgr::deleteVxlanNetdevice(std::string vxlan_dev_name)
     std::string res;
     const std::string cmd = std::string("") + IP_CMD  + " link del dev " + vxlan_dev_name;
     return swss::exec(cmd, res);
+}
+
+int VxlanMgr::setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std::string & mtu)
+{
+    std::string res;
+    const std::string cmd = std::string("") + IP_CMD + " link set dev " + vxlan_dev_name + " mtu " + mtu;
+    return swss::exec(cmd, res);
+}
+
+/*
+ * Set the netdev MTU on every VXLAN netdev that doesn't have it yet, i.e. whose update failed
+ * when it was reconciled after a warm restart. Only a successful "ip link set" is recorded; a
+ * failed one stays pending for doTask() to retry.
+ */
+bool VxlanMgr::syncNetdevMtus()
+{
+    SWSS_LOG_ENTER();
+
+    bool applied = true;
+    for (auto & map : m_vxlanTunnelMapCache)
+    {
+        MapCache & map_entry = map.second;
+        if (map_entry.mtu == VXLAN_NETDEV_MTU)
+        {
+            continue;
+        }
+        SWSS_LOG_NOTICE("Setting MTU %s on VxlanNetDevice %s",
+                        VXLAN_NETDEV_MTU, map_entry.vxlan_dev_name.c_str());
+        if (setVxlanNetdeviceMtu(map_entry.vxlan_dev_name, VXLAN_NETDEV_MTU) != RET_SUCCESS)
+        {
+            SWSS_LOG_WARN("Failed to set MTU %s on VxlanNetDevice %s, retrying",
+                          VXLAN_NETDEV_MTU, map_entry.vxlan_dev_name.c_str());
+            applied = false;
+            continue;
+        }
+        map_entry.mtu = VXLAN_NETDEV_MTU;
+    }
+    m_netdevMtuPending = !applied;
+    return applied;
+}
+
+/* vxlanmgrd calls this on every select timeout: also retry a failed netdev MTU update, once per pass */
+void VxlanMgr::doTask()
+{
+    if (m_netdevMtuPending)
+    {
+        syncNetdevMtus();
+    }
+
+    Orch::doTask();
 }
 
 std::vector<std::string> VxlanMgr::parseNetDev(const string& stdout){

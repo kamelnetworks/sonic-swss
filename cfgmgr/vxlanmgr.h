@@ -42,6 +42,8 @@ public:
         std::string vxlan_dev_name;
         std::string vlan;
         std::string vni_id;
+        // MTU applied to the netdev, "" if unknown
+        std::string mtu;
     } MapCache;
 
     void waitTillReadyToReconcile();
@@ -49,6 +51,7 @@ public:
     void endReconcile(bool warm);
     void restoreVxlanNetDevices();
     bool isTunnelActive(std::string vxlanTunnelName);
+    void doTask() override;
 
     ~VxlanMgr();
 private:
@@ -66,10 +69,13 @@ private:
     bool doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t);
     bool doVxlanEvpnNvoDeleteTask(const KeyOpFieldsValuesTuple & t);
 
+    bool syncNetdevMtus();
+
     void createAppDBTunnelMapTable(const KeyOpFieldsValuesTuple & t);
     void delAppDBTunnelMapTable(std::string vxlanTunnelMapName);
     int createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_id,
                              std::string src_ip, std::string dst_ip, std::string vlan_id);
+    int setVxlanNetdeviceMtu(const std::string & vxlan_dev_name, const std::string & mtu);
     int downVxlanNetdevice(std::string vxlan_dev_name);
     int deleteVxlanNetdevice(std::string vxlan_dev_name);
     std::vector<std::string> parseNetDev(const std::string& stdout);
@@ -118,6 +124,9 @@ private:
     bool m_in_reconcile;
     std::vector<std::string> m_appVxlanTunnelMapKeysRecon;
     std::map<std::string, std::string> m_vxlanNetDevices;
+
+    // Whether a netdev MTU update failed and is waiting for syncNetdevMtus() to retry it
+    bool m_netdevMtuPending = false;
 };
 
 }
