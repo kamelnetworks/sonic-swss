@@ -30,6 +30,10 @@ using namespace swss;
 const string INTFS_PREFIX = "Ethernet";
 const string LAG_PREFIX = "PortChannel";
 
+/* STATE_DB PORT_TABLE field orchagent sets for a port it failed to create */
+const string PORT_CREATE_STATUS = "create_status";
+const string PORT_CREATE_FAILED = "failed";
+
 extern set<string> g_portSet;
 extern bool g_init;
 extern string g_switchType;
@@ -209,4 +213,60 @@ void LinkSync::onMsg(int nlmsg_type, struct nl_object *obj)
     {
         SWSS_LOG_NOTICE("Cannot find %s in port table", key.c_str());
     }
+}
+
+void LinkSync::checkPortInitDone()
+{
+    SWSS_LOG_ENTER();
+
+    if (g_init)
+    {
+        return;
+    }
+
+    /*
+     * orchagent marks a port it gave up creating (e.g. a breakout mode the SAI
+     * refuses) in STATE_DB. Its netdev will never appear, so stop waiting for
+     * it: otherwise one refused row in CONFIG_DB holds PortInitDone back for
+     * every other port, and teamd & co. never start. Check at most once a
+     * second, not on each of the many netlink messages during init.
+     */
+    auto now = chrono::steady_clock::now();
+    bool checkCreateFailed = now - m_lastCreateFailedCheck >= chrono::seconds(1);
+    if (checkCreateFailed)
+    {
+        m_lastCreateFailedCheck = now;
+    }
+
+    for (auto port_iter = g_portSet.begin(); checkCreateFailed && port_iter != g_portSet.end();)
+    {
+        string status;
+        if (m_statePortTable.hget(*port_iter, PORT_CREATE_STATUS, status) && status == PORT_CREATE_FAILED)
+        {
+            SWSS_LOG_ERROR("Port %s was not created by orchagent, not waiting for its host interface",
+                           port_iter->c_str());
+            port_iter = g_portSet.erase(port_iter);
+            continue;
+        }
+        ++port_iter;
+    }
+
+    if (!g_portSet.empty())
+    {
+        return;
+    }
+
+    /*
+     * After finishing reading port configuration file and
+     * creating all host interfaces, this daemon shall send
+     * out a signal to orchagent indicating port initialization
+     * procedure is done and other application could start
+     * syncing.
+     */
+    FieldValueTuple finish_notice("lanes", "0");
+    vector<FieldValueTuple> attrs = { finish_notice };
+    m_portTableProducer.set("PortInitDone", attrs);
+    SWSS_LOG_NOTICE("PortInitDone");
+
+    g_init = true;
 }
