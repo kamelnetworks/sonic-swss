@@ -40,7 +40,7 @@ int main(int argc, char **argv)
             conf_sflow_session_table
         };
 
-        SflowMgr sflowmgr(&appDb, sflow_tables);
+        SflowMgr sflowmgr(&cfgDb, &appDb, sflow_tables);
         /* During process startup, the ordering of config_db followed by state_db notifications cannot be guaranteed 
            and so handle the config events manually */
         sflowmgr.readPortConfig();

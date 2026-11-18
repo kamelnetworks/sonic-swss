@@ -10,8 +10,9 @@
 using namespace std;
 using namespace swss;
 
-SflowMgr::SflowMgr(DBConnector *appDb, const std::vector<TableConnector>& tableNames) :
+SflowMgr::SflowMgr(DBConnector *cfgDb, DBConnector *appDb, const std::vector<TableConnector>& tableNames) :
         Orch(tableNames),
+        m_cfgPortTable(cfgDb, CFG_PORT_TABLE_NAME),
         m_appSflowTable(appDb, APP_SFLOW_TABLE_NAME),
         m_appSflowSessionTable(appDb, APP_SFLOW_SESSION_TABLE_NAME)
 {
@@ -565,19 +566,26 @@ void SflowMgr::doTask(Consumer &consumer)
                 else
                 {
                     m_appSflowSessionTable.del(key);
-                    m_sflowPortConfMap[key].local_rate_cfg = false;
-                    m_sflowPortConfMap[key].local_admin_cfg = false;
-                    m_sflowPortConfMap[key].local_dir_cfg = false;
-                    m_sflowPortConfMap[key].rate = "";
-                    m_sflowPortConfMap[key].admin = "";
-                    m_sflowPortConfMap[key].dir = "";
-
-                    /* If Global configured, set global session on port after local config is deleted */
-                    if (m_intfAllConf)
+                    auto port = m_sflowPortConfMap.find(key);
+                    if (port != m_sflowPortConfMap.end())
                     {
-                        vector<FieldValueTuple> fvs;
-                        sflowGetGlobalInfo(fvs, key, m_intfAllDir);
-                        m_appSflowSessionTable.set(key,fvs);
+                        auto &info = port->second;
+                        info.local_rate_cfg = false;
+                        info.local_admin_cfg = false;
+                        info.local_dir_cfg = false;
+                        info.rate.clear();
+                        info.admin.clear();
+                        info.dir = m_intfAllDir;
+
+                        // Forced breakout can delete PORT and SFLOW_SESSION before
+                        // either notification is handled. The cached port may be stale.
+                        vector<FieldValueTuple> portConfig;
+                        if (m_gEnable && m_intfAllConf && m_cfgPortTable.get(key, portConfig))
+                        {
+                            vector<FieldValueTuple> fvs;
+                            sflowGetGlobalInfo(fvs, key, info.dir);
+                            m_appSflowSessionTable.set(key, fvs);
+                        }
                     }
                 }
             }
