@@ -8,12 +8,19 @@ namespace sflowmgr_ut
     using namespace swss;
     using namespace std;
 
+    class TestSflowMgr : public SflowMgr
+    {
+    public:
+        using SflowMgr::SflowMgr;
+        using Orch::getExecutor;
+    };
+
     struct SflowMgrTest : public ::testing::Test
     {
         shared_ptr<swss::DBConnector> m_app_db;
         shared_ptr<swss::DBConnector> m_config_db;
         shared_ptr<swss::DBConnector> m_state_db;
-        shared_ptr<SflowMgr> m_sflowMgr;
+        shared_ptr<TestSflowMgr> m_sflowMgr;
         SflowMgrTest()
         {
             m_app_db = make_shared<swss::DBConnector>(
@@ -38,7 +45,7 @@ namespace sflowmgr_ut
                 conf_sflow_table,
                 conf_sflow_session_table
             };
-            m_sflowMgr.reset(new SflowMgr(m_config_db.get(), m_app_db.get(), sflow_tables));
+            m_sflowMgr = make_shared<TestSflowMgr>(m_config_db.get(), m_app_db.get(), sflow_tables);
         }
 
         void enableSflow()
