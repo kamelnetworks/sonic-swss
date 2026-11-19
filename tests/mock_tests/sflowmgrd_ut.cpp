@@ -8,12 +8,19 @@ namespace sflowmgr_ut
     using namespace swss;
     using namespace std;
 
+    class TestSflowMgr : public SflowMgr
+    {
+    public:
+        using SflowMgr::SflowMgr;
+        using Orch::getExecutor;
+    };
+
     struct SflowMgrTest : public ::testing::Test
     {
         shared_ptr<swss::DBConnector> m_app_db;
         shared_ptr<swss::DBConnector> m_config_db;
         shared_ptr<swss::DBConnector> m_state_db;
-        shared_ptr<SflowMgr> m_sflowMgr;
+        shared_ptr<TestSflowMgr> m_sflowMgr;
         SflowMgrTest()
         {
             m_app_db = make_shared<swss::DBConnector>(
@@ -38,7 +45,7 @@ namespace sflowmgr_ut
                 conf_sflow_table,
                 conf_sflow_session_table
             };
-            m_sflowMgr.reset(new SflowMgr(m_app_db.get(), sflow_tables));
+            m_sflowMgr = make_shared<TestSflowMgr>(m_config_db.get(), m_app_db.get(), sflow_tables);
         }
 
         void enableSflow()
@@ -66,6 +73,15 @@ namespace sflowmgr_ut
             }
             cfg_sflow_table.set(alias, values);
             m_sflowMgr->addExistingData(&cfg_sflow_table);
+            m_sflowMgr->doTask();
+        }
+
+        void deleteCfgRow(const string &table, const string &alias)
+        {
+            Table(m_config_db.get(), table).del(alias);
+            auto *consumer = dynamic_cast<Consumer *>(m_sflowMgr->getExecutor(table));
+            ASSERT_NE(consumer, nullptr);
+            consumer->addToSync({{alias, DEL_COMMAND, {}}});
             m_sflowMgr->doTask();
         }
 
@@ -141,6 +157,39 @@ namespace sflowmgr_ut
             return "down";
         }
     };
+
+    TEST_F(SflowMgrTest, SessionDeleteDoesNotRestoreRemovedPort)
+    {
+        enableSflow();
+        cfgPortSpeed("Ethernet0", "100000");
+        cfgSflowSession("Ethernet0", true, "5000", "tx");
+        ASSERT_EQ(getSflowSampleRate("Ethernet0"), "5000");
+
+        // CONFIG_DB already reflects port removal, but the PORT consumer
+        // has not received its event yet.
+        Table(m_config_db.get(), CFG_PORT_TABLE_NAME).del("Ethernet0");
+        deleteCfgRow(CFG_SFLOW_SESSION_TABLE_NAME, "Ethernet0");
+        EXPECT_EQ(getSflowSampleRate("Ethernet0"), "");
+
+        deleteCfgRow(CFG_PORT_TABLE_NAME, "Ethernet0");
+        deleteCfgRow(CFG_SFLOW_SESSION_TABLE_NAME, "Ethernet0");
+        EXPECT_EQ(getSflowSampleRate("Ethernet0"), "");
+
+        cfgPortSpeed("Ethernet0", "25000");
+        EXPECT_EQ(getSflowSampleRate("Ethernet0"), "25000");
+        EXPECT_EQ(getSflowSampleDir("Ethernet0"), "rx");
+    }
+
+    TEST_F(SflowMgrTest, SessionDeleteRestoresDefaultForExistingPort)
+    {
+        enableSflow();
+        cfgPortSpeed("Ethernet0", "100000");
+        cfgSflowSession("Ethernet0", false, "5000", "tx");
+        deleteCfgRow(CFG_SFLOW_SESSION_TABLE_NAME, "Ethernet0");
+        EXPECT_EQ(getSflowSampleRate("Ethernet0"), "100000");
+        EXPECT_EQ(getSflowSampleDir("Ethernet0"), "rx");
+        EXPECT_EQ(getSflowAdminStatus("Ethernet0"), "up");
+    }
 
     TEST_F(SflowMgrTest, test_RateConfiguration)
     {

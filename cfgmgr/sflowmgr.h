@@ -31,11 +31,12 @@ typedef std::map<std::string, SflowPortInfo> SflowPortConfMap;
 class SflowMgr : public Orch
 {
 public:
-    SflowMgr(DBConnector *appDb, const std::vector<TableConnector>& tableNames);
+    SflowMgr(DBConnector *cfgDb, DBConnector *appDb, const std::vector<TableConnector>& tableNames);
     void readPortConfig();
 
     using Orch::doTask;
 private:
+    Table                  m_cfgPortTable;
     ProducerStateTable     m_appSflowTable;
     ProducerStateTable     m_appSflowSessionTable;
     SflowPortConfMap       m_sflowPortConfMap;

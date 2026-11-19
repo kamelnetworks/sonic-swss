@@ -1235,6 +1235,28 @@ namespace sflow_test
         EXPECT_NE(info.find(port.m_port_id), info.end());
     }
 
+    TEST_F(SflowOrchTest, InvalidSessionRowsAreConsumedWithoutCreatingSession)
+    {
+        MockSflowOrch mock_orch;
+        setSflowGlobal(mock_orch, {{"admin_state", "up"}});
+
+        const vector<pair<string, string>> invalidRows = {
+            {"", "rx"}, {"100000", ""}, {"4294967296", "rx"},
+            {"1000junk", "rx"}, {"-1", "rx"}, {"999999999999999999999", "rx"}
+        };
+        for (const auto &row : invalidRows)
+        {
+            mock_orch.sessionConsumer().addToSync({{
+                "Ethernet0", SET_COMMAND,
+                {{"admin_state", "up"}, {"sample_rate", row.first}, {"sample_direction", row.second}}
+            }});
+            EXPECT_NO_THROW(mock_orch.drainSessionConsumer());
+            EXPECT_TRUE(mock_orch.sessionConsumer().m_toSync.empty());
+            EXPECT_TRUE(Portal::SflowOrchInternal::getSflowPortInfoMap(mock_orch.get()).empty());
+            EXPECT_TRUE(Portal::SflowOrchInternal::getSflowSampleMap(mock_orch.get()).empty());
+        }
+    }
+
     TEST_F(SflowOrchTest, SflowAddPortRejectsConflictingEgressBinding)
     {
         MockSflowOrch mock_orch;

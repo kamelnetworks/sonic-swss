@@ -3,6 +3,8 @@
 #include "tokenize.h"
 
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include "nlohmann/json.hpp"
 
 using namespace std;
@@ -1000,7 +1002,7 @@ bool SflowOrch::sflowUpdateSampleDirection(sai_object_id_t port_id, string old_d
     return true;
 }
 
-void SflowOrch::sflowExtractInfo(vector<FieldValueTuple> &fvs, bool &admin, uint32_t &rate, string &dir)
+bool SflowOrch::sflowExtractInfo(vector<FieldValueTuple> &fvs, bool &admin, uint32_t &rate, string &dir)
 {
     for (auto i : fvs)
     {
@@ -1019,7 +1021,24 @@ void SflowOrch::sflowExtractInfo(vector<FieldValueTuple> &fvs, bool &admin, uint
         {
             if (fvValue(i) != "error")
             {
-                rate = (uint32_t)stoul(fvValue(i));
+                const auto &value = fvValue(i);
+                if (value.empty() || value.find_first_not_of("0123456789") != string::npos)
+                {
+                    return false;
+                }
+                try
+                {
+                    const auto parsedRate = stoul(value);
+                    if (parsedRate > numeric_limits<uint32_t>::max())
+                    {
+                        return false;
+                    }
+                    rate = static_cast<uint32_t>(parsedRate);
+                }
+                catch (const out_of_range &)
+                {
+                    return false;
+                }
             }
             else
             {
@@ -1034,6 +1053,7 @@ void SflowOrch::sflowExtractInfo(vector<FieldValueTuple> &fvs, bool &admin, uint
             }
         }
     }
+    return dir == "rx" || dir == "tx" || dir == "both";
 }
 
 void SflowOrch::sflowExtractGlobalInfo(vector<FieldValueTuple> &fvs, bool &admin, uint32_t &rate, string &dir, int32_t &drop_monitor_limit)
@@ -1279,7 +1299,12 @@ void SflowOrch::doTask(Consumer &consumer)
                             port.m_port_id, (unsigned int)admin_state, rate, 
                             (sflowInfo != m_sflowPortInfoMap.end()) ? sflowInfo->second.m_sample_dir.c_str() : "n/a");
 
-            sflowExtractInfo(kfvFieldsValues(tuple), admin_state, rate, dir);
+            if (!sflowExtractInfo(kfvFieldsValues(tuple), admin_state, rate, dir))
+            {
+                SWSS_LOG_WARN("Ignoring invalid sFlow session rate or direction for %s", alias.c_str());
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
 
             SWSS_LOG_DEBUG("New Cfg  portOid %" PRIx64 " admin %d rate %d dir %s", 
                             port.m_port_id, (unsigned int)admin_state, rate, dir.c_str());
